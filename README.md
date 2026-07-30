@@ -1,6 +1,13 @@
 # store-redis
 
-**v1.5.0.** The first-party, signed `kind: store` plugin for
+**This plugin's version: v1.0.0.** (Independently versioned from busbar
+itself — see [Versioning](#versioning) below.)
+
+[![CI](https://github.com/GetBusbar/store-redis/actions/workflows/ci.yml/badge.svg)](https://github.com/GetBusbar/store-redis/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/GetBusbar/store-redis)](https://github.com/GetBusbar/store-redis/releases)
+[![License: Apache 2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+
+The first-party, signed `kind: store` plugin for
 [busbar](https://getbusbar.com): the Redis backend for busbar's durable
 governance store, packaged as a droppable `cdylib`. Build it, drop the
 resulting `.so`/`.dylib`/`.dll` into the engine's plugins folder, and set
@@ -8,6 +15,14 @@ resulting `.so`/`.dylib`/`.dll` into the engine's plugins folder, and set
 Redis behind a fleet of busbar nodes means shared virtual keys, budgets,
 usage, and audit across the cluster — the multi-node story a single-file
 SQLite store cannot offer.
+
+## Versioning
+
+This plugin is versioned **independently of busbar** — `v1.0.0` here says
+nothing about which busbar release it is. Compatibility with busbar is
+stated separately: **requires busbar 1.5.0+** (the release that ships the
+signed hybrid plugin ABI this crate loads over). Pin both versions
+explicitly in production; do not assume they move together.
 
 It is a `cdylib` that implements busbar's `Store` trait (via
 [`busbar-plugin-sdk`](https://github.com/GetBusbar/busbarAI/tree/main/crates/plugin-sdk))
@@ -78,9 +93,9 @@ in busbarAI for the full reference. In short:
 BUSBAR_SIGN_KEY=<signing key> busbar-plugin-pack pack \
     --lib target/release/libbusbar_store_redis_plugin.so \
     --name busbar-store-redis-plugin --alias redis --kind store \
-    --version 1.5.0 --publisher busbar \
+    --version 1.0.0 --publisher busbar \
     --license Apache-2.0 \
-    --out busbar-store-redis-plugin-1.5.0-x86_64-linux.tar.gz
+    --out busbar-store-redis-plugin-1.0.0-x86_64-linux.tar.gz
 ```
 
 For local development without a signing key, `busbar-plugin-pack pack
@@ -136,3 +151,10 @@ integration tests (from the sibling `busbarAI` checkout) against that
 same service container — the coverage that crate's tests were written
 for but had never actually been wired into a CI job before this repo's
 workflow.
+
+## License
+
+Licensed **Apache-2.0** ([LICENSE](LICENSE)). Contributions welcome — see
+[CONTRIBUTING.md](CONTRIBUTING.md). Governed by our
+[Code of Conduct](CODE_OF_CONDUCT.md); security issues go through
+[SECURITY.md](SECURITY.md), not public issues.
