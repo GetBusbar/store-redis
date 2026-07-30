@@ -1,0 +1,29 @@
+# SPDX-License-Identifier: Apache-2.0
+[package]
+name = "busbar-store-redis-plugin"
+version = "1.0.0"
+publish = false            # first-party store plugin cdylib, shipped as a packed/signed tarball, not to crates.io
+edition = "2021"
+rust-version = "1.97"
+description = "The Redis store as a droppable busbar plugin — a cdylib exporting the store C ABI. Drop it in the plugins folder and set governance.store: redis. One Redis behind a fleet of busbar nodes means shared virtual keys, budgets, usage, and audit across the cluster."
+license = "Apache-2.0"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# busbar-store-redis is now a SAME-REPO sibling crate (this plugin brings 100% of what it needs — the
+# real logic lives here, not in busbarAI). Only busbar-api/busbar-plugin-sdk still reach into busbarAI
+# — INTERIM local path dependencies into a sibling checkout, since busbarAI isn't public yet; once it
+# ships publicly these become git (pinned rev/tag) or crates.io dependencies instead.
+busbar-api = { path = "../../busbarAI/crates/api" }
+busbar-plugin-sdk = { path = "../../busbarAI/crates/plugin-sdk" }
+busbar-store-redis = { path = "../store-redis" }
+serde_json = "1"
+
+[dev-dependencies]
+# INTERIM local path deps into busbarAI, same rationale as above — dev-only (the end-to-end test loads
+# the built cdylib over the real loader ABI seam, and separately connects to the live Redis
+# independently via the plain busbar-store-redis lib crate), never shipped in the plugin artifact
+# itself.
+busbar-plugin-loader = { path = "../../busbarAI/crates/plugin-loader" }
