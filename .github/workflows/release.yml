@@ -1,0 +1,121 @@
+# Build the store-redis cdylib for each supported target and publish the raw libraries as assets
+# on a GitHub Release. Triggered by pushing a tag like `v1.5.0`.
+#
+# NOTE: this only builds and uploads the UNSIGNED cdylib. Busbar only loads a signed manifest+cdylib
+# tarball (see docs/plugins.md in busbarAI, "Signing and packaging") — packing/signing needs
+# `busbar-plugin-pack` (a busbarAI-crate tool) and the BUSBAR_SIGN_KEY release secret, both of which
+# currently live in the monorepo, not here. Until busbarAI is public and this workflow can pull
+# busbar-plugin-pack as a real dependency, packing + signing is a manual follow-up step run from a
+# busbarAI checkout against the artifacts this workflow produces. This job exists so a signer always
+# has a reproducible, CI-built binary to sign rather than a local one.
+#
+# The sibling checkout points at the public GetBusbar/busbar repo's `1.5.0-dev` branch — same fix
+# applied to this repo's ci.yml (see its header comment); no token needed since the repo is public.
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write   # create the release + upload assets
+
+env:
+  BUSBAR_REF: 1.5.0-dev
+
+jobs:
+  build:
+    name: build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            lib_name: libbusbar_store_redis_plugin.so
+            asset: store-redis-plugin-linux-x86_64.so
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            lib_name: libbusbar_store_redis_plugin.so
+            asset: store-redis-plugin-linux-aarch64.so
+          - os: macos-14
+            target: aarch64-apple-darwin
+            lib_name: libbusbar_store_redis_plugin.dylib
+            asset: store-redis-plugin-macos-arm64.dylib
+    steps:
+      - name: Checkout store-redis
+        uses: actions/checkout@v4
+        with:
+          path: store-redis
+
+      - name: Checkout busbar (sibling path dependency)
+        uses: actions/checkout@v4
+        with:
+          repository: GetBusbar/busbar
+          ref: ${{ env.BUSBAR_REF }}
+          path: busbarAI
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build (release)
+        working-directory: store-redis
+        run: cargo build --release --locked --lib --target ${{ matrix.target }}
+
+      - name: Stage library
+        working-directory: store-redis
+        run: |
+          install -m 0644 "target/${{ matrix.target }}/release/${{ matrix.lib_name }}" "${{ matrix.asset }}"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: store-redis/${{ matrix.asset }}
+          if-no-files-found: error
+
+  release:
+    name: publish release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all libraries
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        run: |
+          cd dist
+          sha256sum store-redis-plugin-* > SHA256SUMS
+          cat SHA256SUMS
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/store-redis-plugin-*
+            dist/SHA256SUMS
+          body: |
+            Prebuilt (UNSIGNED) `store-redis` plugin cdylibs for busbar's `kind: store` plugin
+            loader.
+
+            These are raw libraries, not a loadable plugin tarball — pack and sign one with
+            `busbar-plugin-pack` (from a busbarAI checkout) before dropping it into busbar's
+            `plugins.dir`:
+
+            ```sh
+            BUSBAR_SIGN_KEY=... busbar-plugin-pack pack \
+              --lib store-redis-plugin-linux-x86_64.so \
+              --name busbar-store-redis-plugin --alias redis --kind store \
+              --version ${{ github.ref_name }} --publisher busbar \
+              --license Apache-2.0 \
+              --out busbar-store-redis-plugin-${{ github.ref_name }}-x86_64-linux.tar.gz
+            ```
+
+            Verify the raw library with `sha256sum -c SHA256SUMS` before signing.

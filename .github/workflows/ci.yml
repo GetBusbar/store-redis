@@ -1,0 +1,103 @@
+# Build, test, lint, and format-check the store-redis plugin cdylib on every push/PR.
+#
+# This crate depends on busbar (../busbarAI, a local path dependency — see the README's
+# "Dependencies" section). The busbar repo (GetBusbar/busbar) is public, but 1.5.0's plugin work
+# (this crate's actual dependency surface — plugin-sdk, plugin-loader, api, store-redis) isn't on
+# `main` yet (still pre-release); it lives on the `1.5.0-dev` branch instead, checked out here with
+# no token needed since the repo itself is public. Update BUSBAR_REF once 1.5.0 ships and this can
+# just track `main`.
+#
+# UNLIKE a generic hook plugin, this crate's whole point is a REAL Redis dependency, so this job
+# runs a genuine `redis:7` GitHub Actions service container on every push/PR (not a manual `docker
+# run`, not mocked) and points `REDIS_URL` at it. That feeds:
+#   - this repo's own `tests/e2e.rs`, which dlopens the built cdylib over the real loader ABI seam
+#     against that live Redis;
+#   - `busbar-store-redis`'s own live-Redis integration tests (from the sibling busbarAI checkout) —
+#     coverage that crate's tests were written for (see its `live_store()` doc comment) but had
+#     never actually been wired into a CI job anywhere before this workflow;
+#   - `busbar-store-redis`'s `#[ignore]`d destructive migration-wipe test, run separately, alone,
+#     and with `--test-threads=1` exactly as that test's own doc comment prescribes (it SCAN+DELETEs
+#     the entire `busbar:*` namespace, which is safe here only because this Redis is an ephemeral,
+#     job-scoped container nothing else depends on afterward, and because running it "alone" avoids
+#     the sibling-concurrency data race its doc comment warns about).
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  BUSBAR_REF: 1.5.0-dev
+  REDIS_URL: redis://localhost:6379/0
+
+jobs:
+  test:
+    name: build, test, clippy, fmt
+    runs-on: ubuntu-latest
+
+    services:
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      - name: Checkout store-redis
+        uses: actions/checkout@v4
+        with:
+          path: store-redis
+
+      - name: Checkout busbar (sibling path dependency)
+        uses: actions/checkout@v4
+        with:
+          repository: GetBusbar/busbar
+          ref: ${{ env.BUSBAR_REF }}
+          path: busbarAI
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Wait for redis to be healthy
+        run: |
+          for i in $(seq 1 30); do
+            if redis-cli -h localhost -p 6379 ping | grep -q PONG; then
+              echo "redis is up"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "redis never became healthy" >&2
+          exit 1
+
+      - name: cargo fmt --check
+        working-directory: store-redis
+        run: cargo fmt --all -- --check
+
+      - name: cargo build
+        working-directory: store-redis
+        run: cargo build --all-targets
+
+      - name: cargo clippy
+        working-directory: store-redis
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: cargo test (this repo — unit tests + the real-ABI/real-Redis e2e test)
+        working-directory: store-redis
+        run: cargo test
+
+      - name: cargo test -p busbar-store-redis (the live-Redis tests this service container exists for)
+        working-directory: busbarAI
+        run: cargo test -p busbar-store-redis
+
+      - name: cargo test -p busbar-store-redis -- --ignored (the destructive migration-wipe test, run alone)
+        working-directory: busbarAI
+        run: cargo test -p busbar-store-redis -- --ignored --test-threads=1 migrate_refuses_to_wipe_non_legacy_namespace_with_missing_marker
