@@ -134,7 +134,7 @@ jobs:
             --lib "$lib" \
             --name "busbar-store-redis" --alias "redis" --kind store \
             --version "$ver" --publisher busbar \
-            --description "The Redis store as a droppable busbar plugin — a cdylib exporting the store C ABI. Drop it in the plugins folder and set governance.store: redis. One Redis behind a fleet of busbar nodes means shared virtual keys, budgets, usage, and audit across the cluster." \
+            --description "The Redis store as a droppable busbar plugin — a cdylib exporting the store C ABI. Drop it in the plugins folder and set store.module: redis. One Redis behind a fleet of busbar nodes means shared virtual keys, budgets, usage, and audit across the cluster." \
             --license Apache-2.0 \
             --out "${outdir}/busbar-store-redis-${ver}-${target}.tar.gz" \
             $unsigned_flag
