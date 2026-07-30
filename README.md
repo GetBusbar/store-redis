@@ -11,7 +11,8 @@ The first-party, signed `kind: store` plugin for
 [busbar](https://getbusbar.com): the Redis backend for busbar's durable
 governance store, packaged as a droppable `cdylib`. Build it, drop the
 resulting `.so`/`.dylib`/`.dll` into the engine's plugins folder, and set
-`governance.store: redis`; the engine loads it in-process at boot. One
+`store: { module: redis, settings: { url: "redis://..." } }`; the engine
+loads it in-process at boot. One
 Redis behind a fleet of busbar nodes means shared virtual keys, budgets,
 usage, and audit across the cluster — the multi-node story a single-file
 SQLite store cannot offer.
@@ -25,7 +26,7 @@ signed hybrid plugin ABI this crate loads over). Pin both versions
 explicitly in production; do not assume they move together.
 
 It is a `cdylib` that implements busbar's `Store` trait (via
-[`busbar-plugin-sdk`](https://github.com/GetBusbar/busbarAI/tree/main/crates/plugin-sdk))
+[`busbar-plugin-sdk`](https://github.com/GetBusbar/busbar/tree/main/crates/plugin-sdk))
 and is loaded in-process by busbar over the signed store ABI —
 `dlopen`'d, not spawned as a separate process.
 
@@ -44,14 +45,14 @@ and is loaded in-process by busbar over the signed store ABI —
 This crate (`busbar-store-redis-plugin`) is intentionally a thin
 adapter: all the Redis schema/serialization/retry/TLS logic lives in the
 `busbar-store-redis` library crate it wraps (from the
-[busbarAI](https://github.com/GetBusbar/busbarAI) monorepo — see
+[busbarAI](https://github.com/GetBusbar/busbar) monorepo — see
 [Dependencies](#dependencies)); here we only translate the engine's JSON
 `open` config into a live `RedisStore`.
 
 ## Build
 
 Needs a Rust toolchain ([rustup](https://rustup.rs)), and — interim,
-until [busbarAI](https://github.com/GetBusbar/busbarAI) ships publicly —
+until [busbarAI](https://github.com/GetBusbar/busbar) ships publicly —
 a sibling checkout of `busbarAI` at `../busbarAI` (see
 [Dependencies](#dependencies) below).
 
@@ -67,7 +68,7 @@ cargo fmt --all -- --check
 This crate depends on `busbar-api`, `busbar-plugin-sdk`, and
 `busbar-store-redis` (the KV-modeling logic crate it thinly adapts) —
 and, as a dev-dependency for the end-to-end test, `busbar-plugin-loader`
-— from the [busbarAI](https://github.com/GetBusbar/busbarAI) monorepo.
+— from the [busbarAI](https://github.com/GetBusbar/busbar) monorepo.
 Because busbarAI is not yet public, `Cargo.toml` points at these as
 **local path dependencies** (`../busbarAI/crates/...`), which means this
 repo expects to be checked out as a sibling of `busbarAI`:
@@ -86,7 +87,7 @@ become git (pinned rev/tag) or crates.io dependencies instead. Grep
 
 Once built, the cdylib is packed and signed like any other busbar plugin
 — see
-[`docs/plugins.md`](https://github.com/GetBusbar/busbarAI/blob/main/docs/plugins.md#signing-and-packaging)
+[`docs/plugins.md`](https://github.com/GetBusbar/busbar/blob/main/docs/plugins.md#signing-and-packaging)
 in busbarAI for the full reference. In short:
 
 ```sh
@@ -103,14 +104,20 @@ For local development without a signing key, `busbar-plugin-pack pack
 `plugins.trust.allow_unsigned: true`.
 
 Drop the resulting tarball into busbar's configured `plugins.dir` and
-set `governance.store: redis` (with `governance.db_path` carrying the
-`redis://` URL — see [Config](#config) below) — see
-[`docs/plugins.md`](https://github.com/GetBusbar/busbarAI/blob/main/docs/plugins.md)
-in busbarAI for the full `governance:` wiring reference.
+set:
+
+```yaml
+store:
+  module: redis
+  settings: { url: "redis://:password@host:6379/0" }
+```
+
+— see [`docs/configuration.md`](https://github.com/GetBusbar/busbar/blob/main/docs/configuration.md)
+for the full store config reference.
 
 ## Config
 
-The engine passes `governance.db_path` through as this plugin's `open`
+The engine passes `store.settings` through as this plugin's `open`
 config, mirroring how the Postgres store plugin receives its libpq URL:
 
 ```json
