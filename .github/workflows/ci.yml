@@ -3,12 +3,20 @@
 #
 # busbar-store-redis (the real logic crate) now lives IN THIS REPO (the store-redis/ subdirectory,
 # a same-repo sibling of store-redis-plugin/ — see this repo's root Cargo.toml), not in busbarAI, so
-# there is no more sibling-checkout command to run: the reusable workflow's own `cargo test` step
-# (working-directory: plugin, i.e. this checkout's root) already exercises busbar-store-redis's own
-# unit tests plus store-redis-plugin's real dlopen ABI e2e test against the `redis` service
-# container above, because `cargo test` on a virtual workspace with no default-members runs every
-# member by default.
+# the `ci` job below has no extra sibling-TEST command to run: the reusable workflow's own
+# `cargo test` step (working-directory: plugin, i.e. this checkout's root) already exercises
+# busbar-store-redis's own unit tests plus store-redis-plugin's real dlopen ABI e2e test against the
+# `redis` service container above, because `cargo test` on a virtual workspace with no
+# default-members runs every member by default. This crate's `busbar-api` dependency is STILL a
+# sibling path dependency into busbarAI though (INTERIM until busbarAI is public) — both jobs below
+# need their own busbarAI checkout for that reason.
 name: ci
+
+env:
+  # Same BUSBAR_REF convention ci.yml/release.yml elsewhere establish for the sibling path
+  # dependency (busbar-api) this crate needs — INTERIM until busbarAI is public. Update to `main`
+  # once busbar 1.5.0 ships.
+  BUSBAR_REF: 1.5.0-dev
 
 on:
   push:
@@ -47,11 +55,22 @@ jobs:
         options: >-
           --health-cmd "redis-cli ping" --health-interval 5s --health-timeout 5s --health-retries 10
     steps:
-      - uses: actions/checkout@v7
+      - name: Checkout store-redis
+        uses: actions/checkout@v7
+        with:
+          path: store-redis-repo
+
+      - name: Checkout busbar (sibling path dependency)
+        uses: actions/checkout@v7
+        with:
+          repository: GetBusbar/busbar
+          ref: ${{ env.BUSBAR_REF }}
+          path: busbarAI
+
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: cargo test -p busbar-store-redis -- --ignored migrate_refuses_to_wipe_non_legacy_namespace_with_missing_marker
-        working-directory: store-redis
+        working-directory: store-redis-repo/store-redis
         env:
           REDIS_URL: redis://localhost:6379/0
         run: cargo test -- --ignored --test-threads=1 migrate_refuses_to_wipe_non_legacy_namespace_with_missing_marker
