@@ -12,15 +12,18 @@
 
 use busbar_api::Store;
 use busbar_store_redis::RedisStore;
+use std::time::Duration;
 
 /// Construct a Redis store from the JSON config the engine passes through `open`:
 ///
 /// ```json
-/// { "url": "redis://:password@host:6379/0" }
+/// { "url": "redis://:password@host:6379/0", "connect_timeout_ms": 10000 }
 /// ```
 ///
 /// The engine passes `store.settings` verbatim as this JSON config (see the boot store-load),
-/// mirroring how the Postgres plugin receives its libpq URL.
+/// mirroring how the Postgres plugin receives its libpq URL. `connect_timeout_ms` is optional
+/// (defaults to `busbar-store-redis`'s own default, currently 10s); it bounds the initial connect
+/// so a blackholed/firewalled Redis host fails fast at boot instead of wedging it indefinitely.
 fn open(cfg: &str) -> Result<Box<dyn Store>, String> {
     let v: serde_json::Value = if cfg.trim().is_empty() {
         serde_json::Value::Object(Default::default())
@@ -30,7 +33,11 @@ fn open(cfg: &str) -> Result<Box<dyn Store>, String> {
     let url = v.get("url").and_then(|x| x.as_str()).ok_or_else(|| {
         "redis plugin config requires a \"url\" (a redis:// connection string)".to_string()
     })?;
-    let store = RedisStore::connect(url).map_err(|e| e.0)?;
+    let store = match v.get("connect_timeout_ms").and_then(|x| x.as_u64()) {
+        Some(ms) => RedisStore::connect_with_timeout(url, Duration::from_millis(ms)),
+        None => RedisStore::connect(url),
+    }
+    .map_err(|e| format!("redis plugin: failed to connect: {}", e.0))?;
     Ok(Box::new(store))
 }
 

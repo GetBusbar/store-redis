@@ -210,5 +210,8 @@ fn load_and_exercise_redis_plugin_bad_config_fails_over_abi() {
     let err = load_store(&path, r#"{"url":"not-a-redis-url"}"#)
         .err()
         .expect("an unparseable redis url must fail to load, not silently succeed");
-    assert!(!err.is_empty());
+    assert!(
+        err.contains("redis plugin: failed to connect"),
+        "expected the plugin's own connect-failure context, got: {err}"
+    );
 }

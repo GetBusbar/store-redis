@@ -63,6 +63,12 @@ use busbar_api::{
 };
 use redis::{Commands, Connection};
 use std::sync::Mutex;
+use std::time::Duration;
+
+/// Default connect timeout (`Client::open` + the initial `get_connection`): with no DSN-level
+/// escape hatch (unlike postgres's libpq `connect_timeout`), a blackholed/firewalled host would
+/// otherwise wedge engine boot indefinitely. `connect_with_timeout` lets a caller override this.
+const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 // ── Key-space helpers (one namespace prefix so a Redis shared with other apps never collides) ──────
 const KEY_PREFIX: &str = "busbar:key:";
@@ -195,8 +201,18 @@ pub struct RedisStore {
 
 impl RedisStore {
     /// Connect to Redis with the given URL (e.g. `redis://:pass@host:6379/0`, or
-    /// `rediss://:pass@host:6380/0` for TLS via rustls + OS-native roots).
+    /// `rediss://:pass@host:6380/0` for TLS via rustls + OS-native roots), using the
+    /// [`DEFAULT_CONNECT_TIMEOUT`]. See [`Self::connect_with_timeout`] for a caller-supplied
+    /// timeout.
     pub fn connect(url: &str) -> StoreResult<Self> {
+        Self::connect_with_timeout(url, DEFAULT_CONNECT_TIMEOUT)
+    }
+
+    /// Like [`Self::connect`], but with an explicit connect timeout. Unlike postgres's libpq, the
+    /// `redis` crate gives no DSN-level timeout escape hatch, so a blackholed/firewalled host would
+    /// otherwise hang `get_connection()` indefinitely and wedge engine boot; bounding the initial
+    /// TCP connect here fails fast instead.
+    pub fn connect_with_timeout(url: &str, timeout: Duration) -> StoreResult<Self> {
         let secret = url_password(url);
         // TLS (`rediss://`): the redis driver builds its rustls config against the PROCESS default
         // crypto provider. This crate can live inside a plugin cdylib with its own rustls state, so
@@ -205,10 +221,10 @@ impl RedisStore {
             let _ = rustls::crypto::ring::default_provider().install_default();
         }
         let client = redis::Client::open(url)
-            .map_err(|e| StoreError(scrub(e.to_string(), secret.as_deref())))?;
+            .map_err(|e| StoreError(scrub(format!("redis connect: {e}"), secret.as_deref())))?;
         let conn = client
-            .get_connection()
-            .map_err(|e| StoreError(scrub(e.to_string(), secret.as_deref())))?;
+            .get_connection_with_timeout(timeout)
+            .map_err(|e| StoreError(scrub(format!("redis connect: {e}"), secret.as_deref())))?;
         let store = Self {
             client,
             conn: Mutex::new(Some(conn)),
