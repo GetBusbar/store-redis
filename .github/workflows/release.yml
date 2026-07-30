@@ -30,10 +30,20 @@ permissions:
   attestations: write  # record the build-provenance attestation
 
 env:
-  # Which busbar branch to check out as the sibling path dependency — same BUSBAR_REF convention
-  # ci.yml / plugin-ci.yml already established. Update to `main` once busbar 1.5.0 actually ships;
-  # until then the plugin ABI surface this crate depends on only exists on 1.5.0-dev.
-  BUSBAR_REF: 1.5.0-dev
+  # Which busbar commit to check out as the sibling path dependency, used to build
+  # busbar-plugin-pack for the pack+sign step below (which runs while BUSBAR_SIGN_KEY is in
+  # scope). Pinned to a SHA rather than the mutable `1.5.0-dev` branch so a signing job never
+  # builds pack tooling against branch history it hasn't been reviewed against.
+  #
+  # Pinned to d59b8e97f016ef2256e068e87db6aa0741bdd4f7 — the last commit on 1.5.0-dev before
+  # b5cb40f ("Extract store-redis: remove crates/store-redis[-plugin], now GetBusbar/store-redis"),
+  # i.e. the most recent SHA where crates/store-redis (needed only for its own history/context
+  # here, not as a build input — this repo's own store-redis/ now carries that logic) still
+  # existed on that branch. crates/store-redis no longer exists at 1.5.0-dev's current tip; that
+  # extraction gap is a separately tracked blocker, not something this workflow should route
+  # around by floating to a moving branch ref. Update this SHA (and re-review) once the extraction
+  # lands and 1.5.0-dev stabilizes enough to pin past it.
+  BUSBAR_REF: d59b8e97f016ef2256e068e87db6aa0741bdd4f7
 
 jobs:
   # Create the Release first so the parallel per-target upload jobs have something to attach to
@@ -46,11 +56,25 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release create "${GITHUB_REF_NAME}" \
+          set +e
+          out="$(gh release create "${GITHUB_REF_NAME}" \
             --repo "${GITHUB_REPOSITORY}" \
             --title "busbar-store-redis ${GITHUB_REF_NAME}" \
-            --verify-tag --generate-notes \
-          || gh release view "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}"
+            --verify-tag --generate-notes 2>&1)"
+          status=$?
+          echo "$out"
+          if [ "$status" -eq 0 ]; then
+            exit 0
+          fi
+          # Only swallow the "release already exists" race between the create-release job and a
+          # concurrent/retried run; any other failure (auth, bad tag, API error, etc.) must fail
+          # the job loudly rather than be silently papered over by `gh release view`.
+          if echo "$out" | grep -qi "already exists"; then
+            echo "Release ${GITHUB_REF_NAME} already exists — treating as success (concurrent/retried run)."
+            gh release view "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}"
+          else
+            exit "$status"
+          fi
 
   # One signed .tar.gz per target: {cdylib + manifest.json}, packed by busbar-plugin-pack and
   # signed with the busbar release PRIVATE key (BUSBAR_SIGN_KEY secret) so it verifies as
@@ -132,7 +156,7 @@ jobs:
           lib="store-redis/target/${target}/release/${{ matrix.libprefix }}busbar_store_redis_plugin.${{ matrix.libext }}"
           "$pack" pack \
             --lib "$lib" \
-            --name "busbar-store-redis" --alias "redis" --kind store \
+            --name "busbar-store-redis-plugin" --alias "redis" --kind store \
             --version "$ver" --publisher busbar \
             --description "The Redis store as a droppable busbar plugin — a cdylib exporting the store C ABI. Drop it in the plugins folder and set store.module: redis. One Redis behind a fleet of busbar nodes means shared virtual keys, budgets, usage, and audit across the cluster." \
             --license Apache-2.0 \
