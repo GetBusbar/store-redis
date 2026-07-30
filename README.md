@@ -121,12 +121,13 @@ The engine passes `store.settings` through as this plugin's `open`
 config, mirroring how the Postgres store plugin receives its libpq URL:
 
 ```json
-{ "url": "redis://:password@host:6379/0" }
+{ "url": "redis://:password@host:6379/0", "connect_timeout_ms": 10000 }
 ```
 
 | Setting | Required | Notes |
 |---|---|---|
 | `url` | yes | A `redis://` or `rediss://` (TLS) connection string. TLS is backed by `rustls` (`ring` provider) — no OpenSSL dependency. |
+| `connect_timeout_ms` | no | Bounds the initial connect (unlike libpq's DSN-level `connect_timeout`, the `redis` crate has no URL-level escape hatch, so this crate adds one). Defaults to 10s. A blackholed/firewalled Redis host fails fast at boot instead of wedging the engine indefinitely. |
 
 ## Tests
 

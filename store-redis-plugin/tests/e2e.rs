@@ -3,7 +3,7 @@
 
 //! End-to-end coverage of the `busbar-store-redis-plugin` cdylib loaded over the REAL loader
 //! `load_store` seam against a REAL, live Redis (not a mock, not an in-process fake). This is the
-//! exact seam the engine sees when `governance.store: redis` is configured: a `Box<dyn Store>`
+//! exact seam the engine sees when `store: { module: redis }` is configured: a `Box<dyn Store>`
 //! indistinguishable from a compiled-in store, backed by `dlopen`'d code running the C ABI.
 //!
 //! Unlike a file-backed store (see busbarAI's sqlite plugin end-to-end test, which reopens the
@@ -210,5 +210,8 @@ fn load_and_exercise_redis_plugin_bad_config_fails_over_abi() {
     let err = load_store(&path, r#"{"url":"not-a-redis-url"}"#)
         .err()
         .expect("an unparseable redis url must fail to load, not silently succeed");
-    assert!(!err.is_empty());
+    assert!(
+        err.contains("redis plugin: failed to connect"),
+        "expected the plugin's own connect-failure context, got: {err}"
+    );
 }
