@@ -42,6 +42,9 @@ jobs:
         image: redis:7
         ports:
           - 6379:6379
+        # This healthcheck runs INSIDE the service container (it has its own redis-cli — the
+        # ubuntu-latest RUNNER does not), and GitHub Actions blocks every job step from starting
+        # until it reports healthy. So no separate "wait for redis" step is needed here at all.
         options: >-
           --health-cmd "redis-cli ping"
           --health-interval 5s
@@ -65,18 +68,6 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
-
-      - name: Wait for redis to be healthy
-        run: |
-          for i in $(seq 1 30); do
-            if redis-cli -h localhost -p 6379 ping | grep -q PONG; then
-              echo "redis is up"
-              exit 0
-            fi
-            sleep 1
-          done
-          echo "redis never became healthy" >&2
-          exit 1
 
       - name: cargo fmt --check
         working-directory: store-redis
