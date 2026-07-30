@@ -3,8 +3,9 @@
 
 //! The **Redis store as a droppable busbar plugin** — a `cdylib` exporting the store C ABI. Build it,
 //! drop the resulting `.so`/`.dll`/`.dylib` into the engine's plugins folder, and set
-//! `governance.store: redis`; the engine loads it in-process at boot. One Redis behind a fleet of
-//! busbar nodes means shared virtual keys, budgets, usage, and audit across the cluster.
+//! `store: { module: redis, settings: { url: "redis://..." } }`; the engine loads it in-process at
+//! boot. One Redis behind a fleet of busbar nodes means shared virtual keys, budgets, usage, and
+//! audit across the cluster.
 //!
 //! All the KV modeling lives in the `busbar-store-redis` `lib` crate (which a custom build can also
 //! link statically). Here we only adapt the engine's JSON config into a `RedisStore`.
@@ -18,8 +19,8 @@ use busbar_store_redis::RedisStore;
 /// { "url": "redis://:password@host:6379/0" }
 /// ```
 ///
-/// The engine passes `governance.db_path` as this `url` (see the boot store-load), mirroring how the
-/// Postgres plugin receives its libpq URL.
+/// The engine passes `store.settings` verbatim as this JSON config (see the boot store-load),
+/// mirroring how the Postgres plugin receives its libpq URL.
 fn open(cfg: &str) -> Result<Box<dyn Store>, String> {
     let v: serde_json::Value = if cfg.trim().is_empty() {
         serde_json::Value::Object(Default::default())
