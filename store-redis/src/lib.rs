@@ -106,6 +106,12 @@ const REVISION_KEY: &str = "busbar:revision";
 const SCHEMA_KEY: &str = "busbar:schema";
 const SCHEMA_VERSION: i64 = 5;
 
+/// Internal sentinel: `delete_key`'s outer retry loop uses this to distinguish "credential
+/// membership changed since our watch-set pre-read, restart with a fresh watch set" from a real
+/// terminal error. `redis::ErrorKind` has no built-in "retry me" variant, so this is carried in
+/// the error message rather than the kind.
+const DELETE_KEY_RETRY_SENTINEL: &str = "__internal_delete_key_retry__";
+
 fn usage_key(bucket_id: &str, window_start: u64) -> String {
     format!("busbar:usage:{bucket_id}:{window_start}")
 }
@@ -515,11 +521,26 @@ impl Store for RedisStore {
             c.scan_match::<_, String>(&pattern)?
                 .collect::<Result<Vec<String>, _>>()
         })?;
-        // WATCH both the key row and its credential-id index: a concurrent put_credential (adding a
-        // new slot member) or a concurrent delete touches one of these, aborting and retrying the
-        // whole read+build+EXEC cycle against fresh state.
-        self.with_conn(|c| {
-            redis::transaction(c, &[key_row.as_str(), ids_key.as_str()], |c, pipe| {
+        // WATCH the key row, its credential-id index, AND every current member's own credential
+        // row: a concurrent put_credential can rewrite a slot's row in place (reusing an existing
+        // member of `ids_key`, so SADD never fires and `ids_key` itself doesn't change) — if only
+        // `key_row`/`ids_key` were watched, that in-place rewrite would slip past WATCH entirely,
+        // and this cascade would then destroy the row (and fail to clean up the NEW public_id's
+        // reverse pointer) without ever having observed the change. Because the row-key set itself
+        // depends on `ids_key`'s membership, and membership can also change between our pre-read
+        // and the transaction's WATCH, this loops: any membership change aborts (ids_key is
+        // watched) and we recompute the watch set from scratch against fresh state.
+        self.with_conn(|c| loop {
+            let members: Vec<String> = c.smembers(&ids_key)?;
+            let row_keys: Vec<String> = members
+                .iter()
+                .filter_map(|m| parse_slot_pointer(&format!("{id}:{m}")))
+                .map(|(_, kind, slot)| cred_row_key(id, &kind, slot))
+                .collect();
+            let mut watch_keys: Vec<&str> = vec![key_row.as_str(), ids_key.as_str()];
+            watch_keys.extend(row_keys.iter().map(String::as_str));
+
+            let outcome = redis::transaction(c, &watch_keys, |c, pipe| {
                 let raw: Option<String> = c.get(&key_row)?;
                 let Some(raw) = raw else {
                     // Unknown id (never existed): a real error, matching the SQL backends'
@@ -539,7 +560,22 @@ impl Store for RedisStore {
                     pipe.atomic();
                     return pipe.query(c);
                 }
-                let members: Vec<String> = c.smembers(&ids_key)?;
+                // `redis::transaction`'s own internal WATCH-abort retry reruns this closure with
+                // the SAME fixed `watch_keys` computed above -- it can't recompute which row keys
+                // to watch. So re-read membership fresh here and compare against the outer
+                // pre-read: if it changed, `ids_key` (which IS watched) will already have aborted
+                // this EXEC, but we still need to bail out to the OUTER loop to rebuild `watch_keys`
+                // against the new members' rows, rather than silently proceeding against the stale
+                // set.
+                let fresh_members: Vec<String> = c.smembers(&ids_key)?;
+                if fresh_members.len() != members.len()
+                    || !fresh_members.iter().all(|m| members.contains(m))
+                {
+                    return Err(redis::RedisError::from((
+                        redis::ErrorKind::Client,
+                        DELETE_KEY_RETRY_SENTINEL,
+                    )));
+                }
                 let rev = self.next_revision(c)?;
                 key.enabled = false;
                 key.deleted_at = Some(crate::now());
@@ -576,7 +612,12 @@ impl Store for RedisStore {
                 }
                 pipe.del(&ids_key).ignore();
                 pipe.query(c)
-            })
+            });
+
+            match outcome {
+                Err(e) if e.to_string().contains(DELETE_KEY_RETRY_SENTINEL) => continue,
+                other => break other,
+            }
         })
     }
 
@@ -821,17 +862,31 @@ impl Store for RedisStore {
                 pricing_version: String::new(),
             };
             for (name, val) in fields {
-                let num = || val.parse::<i64>().unwrap_or(0);
+                // Every other decode path in this file (key_from_json, cred_from_json, audit
+                // records) propagates a StoreError on a corrupt value rather than silently
+                // substituting a default -- a malformed numeric field here must not silently
+                // read back as 0 and under-report billing/usage data.
+                let num = |field: &str, val: &str| {
+                    val.parse::<i64>().map_err(|e| {
+                        StoreError(format!("list_metering: bad {field} value {val:?}: {e}"))
+                    })
+                };
                 match name.as_str() {
                     "key_id" => m.key_id = val.clone(),
                     "model" => m.model = val.clone(),
                     "provider" => m.provider = val.clone(),
-                    "tokens_input" => m.tokens_input = read_u64(num()),
-                    "tokens_output" => m.tokens_output = read_u64(num()),
-                    "tokens_cache_read" => m.tokens_cache_read = read_u64(num()),
-                    "tokens_cache_write" => m.tokens_cache_write = read_u64(num()),
-                    "requests" => m.requests = read_u64(num()),
-                    "billable_requests" => m.billable_requests = read_u64(num()),
+                    "tokens_input" => m.tokens_input = read_u64(num("tokens_input", &val)?),
+                    "tokens_output" => m.tokens_output = read_u64(num("tokens_output", &val)?),
+                    "tokens_cache_read" => {
+                        m.tokens_cache_read = read_u64(num("tokens_cache_read", &val)?)
+                    }
+                    "tokens_cache_write" => {
+                        m.tokens_cache_write = read_u64(num("tokens_cache_write", &val)?)
+                    }
+                    "requests" => m.requests = read_u64(num("requests", &val)?),
+                    "billable_requests" => {
+                        m.billable_requests = read_u64(num("billable_requests", &val)?)
+                    }
                     "key_group_at_use" => m.key_group_at_use = val.clone(),
                     "pricing_version" => m.pricing_version = val.clone(),
                     _ => {}

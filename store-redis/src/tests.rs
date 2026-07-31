@@ -132,6 +132,33 @@ fn cred(key_id: &str, public_id: &str, slot: u8) -> CredentialSecret {
     }
 }
 
+/// Per-invocation-unique identifier for tests whose fixture touches a uniqueness constraint
+/// (credential `public_id`, an accumulating usage/metering counter) rather than an idempotent
+/// overwrite. Ordinary point-write tests are already safe to rerun because `put_key`/`SET` simply
+/// overwrites the same row every time -- but a SETNX-style uniqueness check (`public_id` already
+/// claimed) or an accumulating counter (`add_usage`/`add_metering`) sees a SECOND invocation's
+/// identical literal id as a real collision with the FIRST invocation's leftover row, since this
+/// suite deliberately never wipes the shared instance between runs (see `live_store()`). A fresh
+/// process id per `cargo test` invocation, plus a counter for multiple calls within one process,
+/// keeps those specific fixtures unique across repeated runs without reintroducing the per-test
+/// wipe that was already tried and rejected for breaking intra-run parallelism.
+fn unique_suffix() -> u64 {
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    (std::process::id() as u64) * 1_000_000 + n
+}
+
+fn uid(base: &str) -> String {
+    format!("{base}_{}", unique_suffix())
+}
+
+/// Like `uid`, but for the `bucket: u64` metering fields -- a distinct numeric bucket per call,
+/// same rationale as `uid` (metering counters accumulate across invocations of the same literal
+/// bucket, so a fixed literal collides with a prior run's leftover row).
+fn unique_bucket(base: u64) -> u64 {
+    base * 1_000_000_000 + unique_suffix()
+}
+
 // ── Basic key CRUD ──────────────────────────────────────────────────────────────────────────
 
 #[test]
@@ -325,19 +352,21 @@ fn delete_key_removes_usage_windows() {
 #[test]
 fn delete_key_does_not_glob_match_other_keys_usage() {
     let Some(store) = live_store() else { return };
-    store.put_key(&vk("vk_evil_*")).unwrap();
-    store.put_key(&vk("vk_evil_victim")).unwrap();
+    let evil = uid("vk_evil_*");
+    let victim = uid("vk_evil_victim");
+    store.put_key(&vk(&evil)).unwrap();
+    store.put_key(&vk(&victim)).unwrap();
     let d = UsageDelta {
         requests: 1,
         billable_requests: 1,
         models: vec![],
     };
-    store.add_usage("vk_evil_*", 1000, &d).unwrap();
-    store.add_usage("vk_evil_victim", 1000, &d).unwrap();
-    store.delete_key("vk_evil_*").unwrap();
+    store.add_usage(&evil, 1000, &d).unwrap();
+    store.add_usage(&victim, 1000, &d).unwrap();
+    store.delete_key(&evil).unwrap();
     // The victim's usage must survive — an unescaped glob would have matched "vk_evil_victim"
     // as well as the literal "vk_evil_*" pattern.
-    let victim_usage = store.get_usage("vk_evil_victim", 1000).unwrap();
+    let victim_usage = store.get_usage(&victim, 1000).unwrap();
     assert_eq!(
         victim_usage.requests, 1,
         "an unescaped '*' in the deleted key's id must not sweep another key's usage windows"
@@ -402,12 +431,14 @@ fn put_credential_rejects_a_live_slot_but_allows_reclaiming_a_revoked_one() {
 #[test]
 fn public_id_uniqueness_is_enforced_across_slots() {
     let Some(store) = live_store() else { return };
-    let key = vk("vk_uniq");
+    let key_id = uid("vk_uniq");
+    let public_id = uid("AKIA_DUP");
+    let key = vk(&key_id);
     store.put_key(&key).unwrap();
-    let c0 = cred("vk_uniq", "AKIA_DUP", 0);
+    let c0 = cred(&key_id, &public_id, 0);
     store.put_credential(&c0).unwrap();
     // A different slot trying to claim the SAME public_id must fail.
-    let mut c1 = cred_meta("vk_uniq", "AKIA_DUP", 1);
+    let mut c1 = cred_meta(&key_id, &public_id, 1);
     c1.id = "cred_other".to_string();
     let c1 = CredentialSecret {
         meta: c1,
@@ -422,8 +453,10 @@ fn public_id_uniqueness_is_enforced_across_slots() {
 #[test]
 fn revoke_credential_destroys_secret_and_is_idempotent() {
     let Some(store) = live_store() else { return };
-    let key = vk("vk_revoke");
-    let c = cred("vk_revoke", "AKIA_REV", 0);
+    let key_id = uid("vk_revoke");
+    let public_id = uid("AKIA_REV");
+    let key = vk(&key_id);
+    let c = cred(&key_id, &public_id, 0);
     store.put_key_with_credential(&key, &c).unwrap();
 
     store.revoke_credential(&c.meta.id, "compromised").unwrap();
@@ -432,7 +465,7 @@ fn revoke_credential_destroys_secret_and_is_idempotent() {
     // revoked_at is set — the SigV4 verify path checks revoked_at, but defense-in-depth means the
     // plaintext should be gone too.
     let resolved = store
-        .lookup_credential_secret("sigv4", "AKIA_REV")
+        .lookup_credential_secret("sigv4", &public_id)
         .unwrap()
         .expect(
             "revoked credential row must still resolve by public_id (so a revoked-key request \
@@ -460,12 +493,14 @@ fn revoke_credential_unknown_id_is_idempotent_noop() {
 #[test]
 fn list_credentials_never_carries_the_secret() {
     let Some(store) = live_store() else { return };
-    let key = vk("vk_meta");
-    let c = cred("vk_meta", "AKIA_META", 0);
+    let key_id = uid("vk_meta");
+    let public_id = uid("AKIA_META");
+    let key = vk(&key_id);
+    let c = cred(&key_id, &public_id, 0);
     store.put_key_with_credential(&key, &c).unwrap();
-    let metas = store.list_credentials("vk_meta").unwrap();
+    let metas = store.list_credentials(&key_id).unwrap();
     assert_eq!(metas.len(), 1);
-    assert_eq!(metas[0].public_id, "AKIA_META");
+    assert_eq!(metas[0].public_id, public_id);
     // CredentialMeta has no secret field at all — this is a compile-time guarantee, not a
     // runtime check, but assert the shape we actually get back is the meta type.
     let _: &CredentialMeta = &metas[0];
@@ -474,8 +509,10 @@ fn list_credentials_never_carries_the_secret() {
 #[test]
 fn list_credentials_since_carries_the_secret_for_hydration() {
     let Some(store) = live_store() else { return };
-    let key = vk("vk_hydrate");
-    let c = cred("vk_hydrate", "AKIA_HYDRATE", 0);
+    let key_id = uid("vk_hydrate");
+    let public_id = uid("AKIA_HYDRATE");
+    let key = vk(&key_id);
+    let c = cred(&key_id, &public_id, 0);
     store.put_key_with_credential(&key, &c).unwrap();
     // since=0 legitimately also returns other tests' concurrently-created credentials (parallel
     // execution against one shared instance) — find THIS test's own row rather than assert an
@@ -483,7 +520,7 @@ fn list_credentials_since_carries_the_secret_for_hydration() {
     let delta = store.list_credentials_since(0).unwrap();
     let mine = delta
         .iter()
-        .find(|cs| cs.meta.public_id == "AKIA_HYDRATE")
+        .find(|cs| cs.meta.public_id == public_id)
         .expect("this test's credential must be in the delta");
     assert_eq!(
         mine.secret, c.secret,
@@ -505,12 +542,14 @@ fn list_credentials_since_carries_the_secret_for_hydration() {
 #[test]
 fn put_key_with_credential_writes_both_or_neither() {
     let Some(store) = live_store() else { return };
-    let key = vk("vk_atomic");
-    let c = cred("vk_atomic", "AKIA_ATOMIC", 0);
+    let key_id = uid("vk_atomic");
+    let public_id = uid("AKIA_ATOMIC");
+    let key = vk(&key_id);
+    let c = cred(&key_id, &public_id, 0);
     store.put_key_with_credential(&key, &c).unwrap();
-    assert!(store.get_key("vk_atomic").unwrap().is_some());
+    assert!(store.get_key(&key_id).unwrap().is_some());
     assert!(store
-        .lookup_credential_secret("sigv4", "AKIA_ATOMIC")
+        .lookup_credential_secret("sigv4", &public_id)
         .unwrap()
         .is_some());
 }
@@ -520,10 +559,12 @@ fn put_key_with_credential_writes_both_or_neither() {
 #[test]
 fn metering_round_trips_all_fields_including_renamed_and_new_ones() {
     let Some(store) = live_store() else { return };
+    let key_id = uid("vk_m");
+    let bucket = unique_bucket(20260731);
     store
         .add_metering(&MeteringDelta {
-            key_id: "vk_m".to_string(),
-            bucket: 20260731,
+            key_id: key_id.clone(),
+            bucket,
             model: "claude".to_string(),
             provider: "anthropic".to_string(),
             tokens_input: 10,
@@ -536,7 +577,7 @@ fn metering_round_trips_all_fields_including_renamed_and_new_ones() {
             pricing_version: "2026-07".to_string(),
         })
         .unwrap();
-    let rows = store.list_metering(20260731).unwrap();
+    let rows = store.list_metering(bucket).unwrap();
     assert_eq!(rows.len(), 1);
     let r = &rows[0];
     assert_eq!(
@@ -551,9 +592,10 @@ fn metering_round_trips_all_fields_including_renamed_and_new_ones() {
 #[test]
 fn metering_attribution_is_first_write_wins() {
     let Some(store) = live_store() else { return };
+    let bucket = unique_bucket(20260801);
     let base = MeteringDelta {
-        key_id: "vk_snap".to_string(),
-        bucket: 20260801,
+        key_id: uid("vk_snap"),
+        bucket,
         model: "m".to_string(),
         provider: "p".to_string(),
         tokens_input: 1,
@@ -570,7 +612,7 @@ fn metering_attribution_is_first_write_wins() {
     second.key_group_at_use = "second-group".to_string();
     second.pricing_version = "v2".to_string();
     store.add_metering(&second).unwrap();
-    let rows = store.list_metering(20260801).unwrap();
+    let rows = store.list_metering(bucket).unwrap();
     assert_eq!(
         rows[0].key_group_at_use, "first-group",
         "attribution snapshots at first use"
