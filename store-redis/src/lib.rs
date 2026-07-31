@@ -97,6 +97,22 @@ fn usage_key(bucket_id: &str, window_start: u64) -> String {
     format!("busbar:usage:{bucket_id}:{window_start}")
 }
 
+/// Escape Redis glob metacharacters (`*`, `?`, `[`, `]`, and the escape character `\` itself) in a
+/// value that must match LITERALLY inside a `SCAN MATCH` pattern. Without this, a virtual key id
+/// containing one of these characters lets `delete_key`'s cleanup SCAN match keys belonging to OTHER
+/// buckets/ids that merely share a glob-matching prefix — e.g. an id of `*` would match every
+/// `busbar:usage:*:*` key in the entire namespace, not just this key's own usage windows.
+fn escape_glob(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if matches!(c, '*' | '?' | '[' | ']' | '\\') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
 /// Hash field for one (model, tier) token counter: `m:<model>:<tier>`. Parsed with a RIGHT split on
 /// the tier so a model name containing `:` still round-trips.
 fn model_field(model: &str, tier: &str) -> String {
@@ -448,36 +464,41 @@ impl Store for RedisStore {
     }
 
     fn delete_key(&self, id: &str) -> StoreResult<()> {
-        // READ phase: collect everything the cascade must remove (usage windows via a non-blocking
-        // SCAN; the key's AccessKeyIds via SMEMBERS). Reads are outside the transaction - the
-        // in-memory engine is the sole writer for a key's lifecycle, and a concurrent write after
-        // the read would at worst leave a benign dangling index member that list paths skip.
-        let pattern = format!("busbar:usage:{id}:*");
+        // Usage windows: a non-blocking SCAN outside the transaction. A concurrent add_usage/
+        // put_usage creating a NEW window between this SCAN and the EXEC below leaves that one
+        // window's usage rows behind (a lesser, already-tracked gap: stale data, not an identity/
+        // auth issue) - the credential race below is the one that must not reopen.
+        let pattern = format!("busbar:usage:{}:*", escape_glob(id));
         let usage_keys: Vec<String> = self.with_conn(|c| {
             c.scan_match::<_, String>(&pattern)?
                 .collect::<Result<Vec<String>, _>>()
         })?;
-        let cred_ids: Vec<String> =
-            self.with_conn(|c| c.smembers(format!("{AWSCRED_IDS_PREFIX}{id}")))?;
 
-        // WRITE phase: the ENTIRE delete cascade as ONE atomic MULTI/EXEC. Either everything goes
-        // (key row, key index, usage windows, every credential + its index memberships, the id map)
-        // or nothing does - a mid-cascade failure can never orphan a SigV4 credential behind a
-        // deleted key (the bug this replaces: N independent commands).
+        // Credentials: WATCH the id->AccessKeyIds index and re-read it INSIDE the optimistic
+        // transaction (`redis::transaction` = WATCH, re-run the closure from scratch on EXEC
+        // failure). A concurrent `put_aws_credential` that adds a NEW AccessKeyId to this key
+        // between the read and the EXEC touches the watched key, so EXEC fails and the whole
+        // read+build+EXEC cycle retries against the fresh membership - closing the window where a
+        // credential added mid-delete could survive as a live, unindexed-but-still-active
+        // credential after its owning key is "gone" (an auth-bypass: the crate's own invariant is
+        // "a revoked key's SigV4 credential cannot outlive it").
+        let cred_ids_key = format!("{AWSCRED_IDS_PREFIX}{id}");
         self.with_conn(|c| {
-            let mut pipe = redis::pipe();
-            pipe.atomic();
-            pipe.del(format!("{KEY_PREFIX}{id}")).ignore();
-            pipe.srem(KEYS_INDEX, id).ignore();
-            for k in &usage_keys {
-                pipe.del(k).ignore();
-            }
-            for akid in &cred_ids {
-                pipe.del(format!("{AWSCRED_PREFIX}{akid}")).ignore();
-                pipe.srem(AWSCRED_INDEX, akid).ignore();
-            }
-            pipe.del(format!("{AWSCRED_IDS_PREFIX}{id}")).ignore();
-            pipe.query(c)
+            redis::transaction(c, &[cred_ids_key.as_str()], |c, pipe| {
+                let cred_ids: Vec<String> = c.smembers(&cred_ids_key)?;
+                pipe.atomic();
+                pipe.del(format!("{KEY_PREFIX}{id}")).ignore();
+                pipe.srem(KEYS_INDEX, id).ignore();
+                for k in &usage_keys {
+                    pipe.del(k).ignore();
+                }
+                for akid in &cred_ids {
+                    pipe.del(format!("{AWSCRED_PREFIX}{akid}")).ignore();
+                    pipe.srem(AWSCRED_INDEX, akid).ignore();
+                }
+                pipe.del(&cred_ids_key).ignore();
+                pipe.query(c)
+            })
         })
     }
 

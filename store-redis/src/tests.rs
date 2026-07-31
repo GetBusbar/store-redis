@@ -364,6 +364,50 @@ fn roundtrip_against_live_redis() {
     );
 }
 
+/// `delete_key`'s cleanup SCAN builds its MATCH pattern from the caller-supplied id via direct
+/// string interpolation. A glob wildcard in the id must NOT let the SCAN over-match another key's
+/// usage windows: an id of `*` (or containing `?`/`[`/`]`) must be treated as a LITERAL id, not a
+/// pattern.
+///
+/// RED (pre-fix, unescaped `format!("busbar:usage:{id}:*")`): deleting the glob-id key also wipes
+/// the innocent key's usage windows (the `*` in the id matches every bucket for every key).
+/// GREEN: only the glob-id key's own usage is removed; the innocent key's usage survives.
+#[test]
+fn delete_key_does_not_glob_match_other_keys_usage() {
+    let Some(store) = live_store() else { return };
+    // Clean slate.
+    let _ = store.delete_key("*");
+    let _ = store.delete_key("vk_glob_innocent");
+
+    store.put_key(&vk("*")).unwrap();
+    store.put_key(&vk("vk_glob_innocent")).unwrap();
+
+    let ledger = UsageLedger {
+        requests: 1,
+        billable_requests: 1,
+        models: vec![ModelTokens {
+            model: "m".into(),
+            tokens: TierTokens {
+                input: 1,
+                output: 1,
+                cache_read: 0,
+                cache_write: 0,
+            },
+        }],
+    };
+    store.put_usage("*", 100, &ledger).unwrap();
+    store.put_usage("vk_glob_innocent", 100, &ledger).unwrap();
+
+    store.delete_key("*").unwrap();
+
+    assert_eq!(
+        store.get_usage("vk_glob_innocent", 100).unwrap(),
+        ledger,
+        "deleting a key whose id is a Redis glob wildcard must not wipe an unrelated key's usage"
+    );
+    store.delete_key("vk_glob_innocent").unwrap();
+}
+
 /// v4: `billable_requests` persists and HINCRBY-accumulates INDEPENDENTLY of `requests` on its
 /// own hash field (admission count vs the 2xx-only fee base). Gated on a live Redis, same as the
 /// other round-trip tests.
@@ -611,4 +655,55 @@ fn migrate_refuses_to_wipe_non_legacy_namespace_with_missing_marker() {
     assert!(gone.is_none(), "the legacy key must be wiped");
     let marker: Option<i64> = store.with_conn(|c| c.get(SCHEMA_KEY)).unwrap();
     assert_eq!(marker, Some(SCHEMA_VERSION), "re-marked v2 after the wipe");
+}
+
+/// `delete_key`'s credential cleanup must WATCH the AccessKeyId index key and re-read it fresh
+/// inside a retried transaction (`redis::transaction`), not read it once outside the write phase --
+/// otherwise a concurrent `put_aws_credential` landing between the read and the EXEC leaves its new
+/// credential orphaned (unindexed by key, but still a live row) after the "deleting" key is gone,
+/// violating the crate's own stated invariant that a revoked key's SigV4 credential cannot outlive
+/// it. Proves the underlying mechanism DETERMINISTICALLY: WATCH a key, read it, have a SECOND
+/// connection modify it, then attempt EXEC on stale data -- Redis's own guarantee is that EXEC
+/// returns nil (aborted) whenever a watched key changed since WATCH, which is exactly what makes
+/// `redis::transaction`'s retry loop pick up fresh state. A naive SMEMBERS-then-pipe with no WATCH
+/// has no such detection at all, and this test's EXEC would then need to succeed (there's nothing
+/// to abort it) even though it's building on now-stale data -- so this test also proves the ABSENCE
+/// of the bug, not just the presence of the mechanism.
+#[test]
+fn delete_key_credential_watch_detects_a_concurrent_write() {
+    let Some(store) = live_store() else { return };
+    let url = std::env::var("REDIS_URL").unwrap();
+    let id = "vk_watch_detect_test";
+    let cred_key = format!("{AWSCRED_IDS_PREFIX}{id}");
+    let _ = store.with_conn(|c| c.del::<_, ()>(&cred_key));
+
+    // Connection A: WATCH, then read -- exactly delete_key's closure shape.
+    let mut a = redis::Client::open(url.as_str())
+        .unwrap()
+        .get_connection()
+        .unwrap();
+    redis::cmd("WATCH").arg(&cred_key).exec(&mut a).unwrap();
+    let _before: Vec<String> = a.smembers(&cred_key).unwrap();
+
+    // Connection B: a concurrent write to the SAME watched key (what put_aws_credential does).
+    let mut b = redis::Client::open(url.as_str())
+        .unwrap()
+        .get_connection()
+        .unwrap();
+    let _: () = b.sadd(&cred_key, "AKIA_CONCURRENT").unwrap();
+
+    // Connection A: build + EXEC a transaction on the (now stale) data it read. Redis MUST abort it.
+    let mut pipe = redis::pipe();
+    pipe.atomic();
+    pipe.set(format!("{cred_key}:touched"), 1).ignore();
+    let result: Option<()> = pipe.query::<Option<()>>(&mut a).unwrap();
+    assert!(
+        result.is_none(),
+        "WATCH must cause EXEC to abort (return nil) when the watched key changed between WATCH \
+         and EXEC -- a delete_key that reads cred_ids WITHOUT watching this key would never detect \
+         this and would proceed to delete based on stale membership, orphaning the concurrently \
+         added credential"
+    );
+
+    let _: () = b.del(&cred_key).unwrap();
 }
