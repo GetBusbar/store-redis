@@ -445,14 +445,23 @@ impl Store for RedisStore {
 
     fn list_keys(&self) -> StoreResult<Vec<VirtualKey>> {
         let ids: Vec<String> = self.with_conn(|c| c.smembers(KEYS_INDEX))?;
-        let mut out = Vec::with_capacity(ids.len());
-        for id in ids {
-            // A dangling index member (row removed out-of-band) is skipped, not an error.
-            if let Some(raw) =
-                self.with_conn(|c| c.get::<_, Option<String>>(format!("{KEY_PREFIX}{id}")))?
-            {
-                out.push(key_from_json(&raw)?);
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        // ONE pipelined round trip for every id's GET instead of one round trip per id: a fleet
+        // with many keys turned list_keys into N sequential network round trips, each serializing
+        // behind this crate's single mutex-guarded connection.
+        let raws: Vec<Option<String>> = self.with_conn(|c| {
+            let mut pipe = redis::pipe();
+            for id in &ids {
+                pipe.get(format!("{KEY_PREFIX}{id}"));
             }
+            pipe.query(c)
+        })?;
+        let mut out = Vec::with_capacity(ids.len());
+        for raw in raws.into_iter().flatten() {
+            // A dangling index member (row removed out-of-band) is skipped, not an error.
+            out.push(key_from_json(&raw)?);
         }
         // Deterministic order (mirrors the SQL backends' ORDER BY created_at, then id as a tiebreak).
         out.sort_by(|a, b| {
@@ -682,10 +691,20 @@ impl Store for RedisStore {
 
     fn list_metering(&self, bucket: u64) -> StoreResult<Vec<MeteringRow>> {
         let set = metering_set(bucket);
-        let rows: Vec<String> = self.with_conn(|c| c.smembers(&set))?;
-        let mut out = Vec::with_capacity(rows.len());
-        for row_key in rows {
-            let fields: Vec<(String, String)> = self.with_conn(|c| c.hgetall(&row_key))?;
+        let row_keys: Vec<String> = self.with_conn(|c| c.smembers(&set))?;
+        if row_keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        // ONE pipelined round trip for every row's HGETALL instead of one round trip per row.
+        let all_fields: Vec<Vec<(String, String)>> = self.with_conn(|c| {
+            let mut pipe = redis::pipe();
+            for row_key in &row_keys {
+                pipe.hgetall(row_key);
+            }
+            pipe.query(c)
+        })?;
+        let mut out = Vec::with_capacity(row_keys.len());
+        for fields in all_fields {
             if fields.is_empty() {
                 continue; // a stale index member with no hash - skip
             }
@@ -775,15 +794,22 @@ impl Store for RedisStore {
 
     fn list_aws_credentials(&self) -> StoreResult<Vec<AwsCredential>> {
         let ids: Vec<String> = self.with_conn(|c| c.smembers(AWSCRED_INDEX))?;
-        let mut out = Vec::with_capacity(ids.len());
-        for akid in ids {
-            if let Some(raw) =
-                self.with_conn(|c| c.get::<_, Option<String>>(format!("{AWSCRED_PREFIX}{akid}")))?
-            {
-                let cred: AwsCredential = serde_json::from_str(&raw)
-                    .map_err(|e| StoreError(format!("aws credential decode failed: {e}")))?;
-                out.push(cred);
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        // ONE pipelined round trip for every id's GET instead of one round trip per id.
+        let raws: Vec<Option<String>> = self.with_conn(|c| {
+            let mut pipe = redis::pipe();
+            for akid in &ids {
+                pipe.get(format!("{AWSCRED_PREFIX}{akid}"));
             }
+            pipe.query(c)
+        })?;
+        let mut out = Vec::with_capacity(ids.len());
+        for raw in raws.into_iter().flatten() {
+            let cred: AwsCredential = serde_json::from_str(&raw)
+                .map_err(|e| StoreError(format!("aws credential decode failed: {e}")))?;
+            out.push(cred);
         }
         Ok(out)
     }

@@ -707,3 +707,60 @@ fn delete_key_credential_watch_detects_a_concurrent_write() {
 
     let _: () = b.del(&cred_key).unwrap();
 }
+
+/// `list_keys`, `list_aws_credentials`, and `list_metering` now pipeline their per-item reads
+/// (one round trip instead of N). Proves multiple distinct items don't get misaligned/swapped
+/// across the pipelined results.
+#[test]
+fn pipelined_list_reads_do_not_misalign_multiple_items() {
+    let Some(store) = live_store() else { return };
+    for id in ["vk_pipe_a", "vk_pipe_b", "vk_pipe_c"] {
+        let _ = store.delete_key(id);
+    }
+    for (id, name) in [
+        ("vk_pipe_a", "Alpha"),
+        ("vk_pipe_b", "Bravo"),
+        ("vk_pipe_c", "Charlie"),
+    ] {
+        let mut k = vk(id);
+        k.name = name.to_string();
+        store.put_key(&k).unwrap();
+        store
+            .put_aws_credential(&AwsCredential {
+                access_key_id: format!("AKIA_{id}"),
+                key_id: id.into(),
+                secret_access_key: format!("secret_{id}"),
+            })
+            .unwrap();
+    }
+
+    let keys = store.list_keys().unwrap();
+    for (id, name) in [
+        ("vk_pipe_a", "Alpha"),
+        ("vk_pipe_b", "Bravo"),
+        ("vk_pipe_c", "Charlie"),
+    ] {
+        let k = keys
+            .iter()
+            .find(|k| k.id == id)
+            .unwrap_or_else(|| panic!("{id} missing from list_keys"));
+        assert_eq!(k.name, name, "list_keys misaligned results for {id}");
+    }
+
+    let creds = store.list_aws_credentials().unwrap();
+    for id in ["vk_pipe_a", "vk_pipe_b", "vk_pipe_c"] {
+        let c = creds
+            .iter()
+            .find(|c| c.key_id == id)
+            .unwrap_or_else(|| panic!("{id}'s credential missing from list_aws_credentials"));
+        assert_eq!(
+            c.access_key_id,
+            format!("AKIA_{id}"),
+            "list_aws_credentials misaligned results for {id}"
+        );
+    }
+
+    for id in ["vk_pipe_a", "vk_pipe_b", "vk_pipe_c"] {
+        store.delete_key(id).unwrap();
+    }
+}
