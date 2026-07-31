@@ -67,7 +67,7 @@ fn key(id: &str) -> VirtualKey {
         id: id.into(),
         generation_hash: "binding:vk_e2e_dlopen:g0".into(),
         name: "e2e-dlopen-key".into(),
-        allowed_pools: Some(vec!["p".into()]),
+        allowed_scopes: Some(vec![busbar_api::ScopeRef::pool("p")]),
         enabled: true,
         created_at: 42,
         group: Some("infra".into()),
@@ -172,7 +172,10 @@ fn load_and_exercise_redis_plugin_persists_to_real_redis_across_reopen() {
         .expect("get_key via the direct connection")
         .expect("the key must be physically present in Redis, bypassing the plugin");
     assert_eq!(direct_key.name, "e2e-dlopen-key");
-    assert_eq!(direct_key.allowed_pools, Some(vec!["p".to_string()]));
+    assert_eq!(
+        direct_key.allowed_scopes,
+        Some(vec![busbar_api::ScopeRef::pool("p")])
+    );
     let direct_usage = Store::get_usage(&direct, "vk_e2e_dlopen", 200)
         .expect("get_usage via the direct connection");
     assert_eq!(

@@ -97,7 +97,7 @@ fn vk(id: &str) -> VirtualKey {
         id: id.to_string(),
         generation_hash: format!("binding:{id}:g0"),
         name: "test key".to_string(),
-        allowed_pools: None,
+        allowed_scopes: None,
         enabled: true,
         created_at: 1000,
         group: None,
