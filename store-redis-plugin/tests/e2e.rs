@@ -65,13 +65,16 @@ fn redis_url() -> Option<String> {
 fn key(id: &str) -> VirtualKey {
     VirtualKey {
         id: id.into(),
-        key_hash: "hash-e2e".into(),
+        generation_hash: "binding:vk_e2e_dlopen:g0".into(),
         name: "e2e-dlopen-key".into(),
-        allowed_pools: Some(vec!["p".into()]),
+        allowed_scopes: Some(vec![busbar_api::ScopeRef::pool("p")]),
         enabled: true,
         created_at: 42,
         group: Some("infra".into()),
         labels: std::collections::BTreeMap::from([("env".into(), "e2e".into())]),
+        expires_at: None,
+        deleted_at: None,
+        revision: 0,
     }
 }
 
@@ -169,7 +172,10 @@ fn load_and_exercise_redis_plugin_persists_to_real_redis_across_reopen() {
         .expect("get_key via the direct connection")
         .expect("the key must be physically present in Redis, bypassing the plugin");
     assert_eq!(direct_key.name, "e2e-dlopen-key");
-    assert_eq!(direct_key.allowed_pools, Some(vec!["p".to_string()]));
+    assert_eq!(
+        direct_key.allowed_scopes,
+        Some(vec![busbar_api::ScopeRef::pool("p")])
+    );
     let direct_usage = Store::get_usage(&direct, "vk_e2e_dlopen", 200)
         .expect("get_usage via the direct connection");
     assert_eq!(
@@ -195,7 +201,7 @@ fn load_and_exercise_redis_plugin_bad_config_fails_over_abi() {
         .err()
         .expect("malformed config JSON must fail to load, not silently succeed");
     assert!(
-        err.contains("invalid redis plugin config"),
+        err.contains("invalid valkey plugin config"),
         "the plugin's own error message should survive the ABI crossing intact: {err}"
     );
 
@@ -211,7 +217,7 @@ fn load_and_exercise_redis_plugin_bad_config_fails_over_abi() {
         .err()
         .expect("an unparseable redis url must fail to load, not silently succeed");
     assert!(
-        err.contains("redis plugin: failed to connect"),
+        err.contains("valkey plugin: failed to connect"),
         "expected the plugin's own connect-failure context, got: {err}"
     );
 }
