@@ -75,7 +75,6 @@ use busbar_api::{
 use redis::{Commands, Connection};
 use std::sync::Mutex;
 use std::time::Duration;
-
 /// Default connect timeout (`Client::open` + the initial `get_connection`): with no DSN-level
 /// escape hatch (unlike postgres's libpq `connect_timeout`), a blackholed/firewalled host would
 /// otherwise wedge engine boot indefinitely. `connect_with_timeout` lets a caller override this.
@@ -160,10 +159,34 @@ fn parse_model_field(field: &str) -> Option<(&str, &str)> {
 fn metering_set(bucket: u64) -> String {
     format!("busbar:metering:{bucket}")
 }
+/// Escape `\` and the `|` join delimiter (in that order, so the escape character itself round-trips
+/// unambiguously) in one `metering_row` component. Without this, two DISTINCT `(key_id, model,
+/// provider)` triples can collide onto the identical joined string whenever a component contains a
+/// literal `|` — e.g. `("k", "a|b", "p")` and `("k", "a", "b|p")` both join to `"k|a|b|p"` — merging
+/// two logically separate metering rows' HINCRBY'd counters into one. Neither `key_id` (busbar-
+/// generated) nor `model`/`provider` (operator-configured lane names, never restricted to a fixed
+/// charset anywhere upstream) is guaranteed `|`-free, so this is not a theoretical concern.
+fn escape_metering_component(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if matches!(c, '\\' | '|') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
 fn metering_row(bucket: u64, key_id: &str, model: &str, provider: &str) -> String {
-    // `|` joins the composite row identity; it is not a legal character in a model/provider name in
-    // practice, and even if present it only affects the row's own key (never cross-row correctness).
-    format!("busbar:metering:{bucket}:{key_id}|{model}|{provider}")
+    // Each component is escaped before joining (see `escape_metering_component`), so the join is
+    // injective: two different `(key_id, model, provider)` triples can never produce the same row
+    // key, even when a component itself contains `|` or `\`.
+    format!(
+        "busbar:metering:{bucket}:{}|{}|{}",
+        escape_metering_component(key_id),
+        escape_metering_component(model),
+        escape_metering_component(provider)
+    )
 }
 
 /// Clamp a `u64` into `i64` for Redis integer ops (HINCRBY is signed) - a value above `i64::MAX` pins
@@ -249,13 +272,18 @@ pub struct RedisStore {
 }
 
 impl RedisStore {
-    /// Connect (e.g. `redis://:pass@host:6379/0`, or `rediss://:pass@host:6380/0` for TLS via
-    /// rustls + OS-native roots), using the [`DEFAULT_CONNECT_TIMEOUT`].
+    /// Connect to Redis with the given URL (e.g. `redis://:pass@host:6379/0`, or
+    /// `rediss://:pass@host:6380/0` for TLS via rustls + OS-native roots), using the
+    /// [`DEFAULT_CONNECT_TIMEOUT`]. See [`Self::connect_with_timeout`] for a caller-supplied
+    /// timeout.
     pub fn connect(url: &str) -> StoreResult<Self> {
         Self::connect_with_timeout(url, DEFAULT_CONNECT_TIMEOUT)
     }
 
-    /// Like [`Self::connect`], but with an explicit connect timeout.
+    /// Like [`Self::connect`], but with an explicit connect timeout. Unlike postgres's libpq, the
+    /// `redis` crate gives no DSN-level timeout escape hatch, so a blackholed/firewalled host would
+    /// otherwise hang `get_connection()` indefinitely and wedge engine boot; bounding the initial
+    /// TCP connect here fails fast instead.
     pub fn connect_with_timeout(url: &str, timeout: Duration) -> StoreResult<Self> {
         let secret = url_password(url);
         if url.starts_with("rediss://") {
@@ -602,11 +630,23 @@ impl Store for RedisStore {
                     let row_key = cred_row_key(id, &kind, slot);
                     // Need the row's public_id to clean up its reverse pointer — read it (still
                     // inside the WATCHed transaction closure, so this is consistent with the EXEC).
-                    if let Ok(Some(raw)) = c.get::<_, Option<String>>(&row_key) {
-                        if let Ok(cred) = serde_json::from_str::<CredentialSecret>(&raw) {
-                            pipe.del(cred_pub_key(&kind, &cred.meta.public_id)).ignore();
-                            pipe.del(cred_id_key(&cred.meta.id)).ignore();
-                        }
+                    // A missing row is a legitimate no-op (already gone). A row that IS present but
+                    // fails to decode must abort the whole cascade rather than be silently skipped
+                    // — an `if let Ok(...) = ...` swallow here would still delete the row while
+                    // leaving its `cred:pub:*`/`cred:id:*` reverse pointers permanently dangling,
+                    // reporting `delete_key` as a success despite violating its own "destroy every
+                    // credential row + pointers" contract. Every other decode path in this file
+                    // (key_from_json, cred_from_json, list_metering) propagates a corrupt value as
+                    // an error rather than silently under-delivering; this matches that.
+                    if let Some(raw) = c.get::<_, Option<String>>(&row_key)? {
+                        let cred: CredentialSecret = serde_json::from_str(&raw).map_err(|_| {
+                            redis::RedisError::from((
+                                redis::ErrorKind::Client,
+                                "delete_key: corrupt credential row",
+                            ))
+                        })?;
+                        pipe.del(cred_pub_key(&kind, &cred.meta.public_id)).ignore();
+                        pipe.del(cred_id_key(&cred.meta.id)).ignore();
                     }
                     pipe.del(&row_key).ignore();
                 }
@@ -917,19 +957,33 @@ impl Store for RedisStore {
             redis::transaction(c, &[row_key.as_str(), pub_key.as_str()], |c, pipe| {
                 let existing: Option<String> = c.get(&row_key)?;
                 let mut old_pub: Option<String> = None;
+                let mut old_id: Option<String> = None;
                 if let Some(raw) = &existing {
                     let cur: CredentialSecret = serde_json::from_str(raw).map_err(|_| {
                         redis::RedisError::from((redis::ErrorKind::Client, "cred decode"))
                     })?;
                     if cur.meta.revoked_at.is_none() {
-                        // Slot occupied by a LIVE credential — an explicit mint into it would
-                        // silently destroy a working credential mid-overlap-window. Fail loud.
+                        if cur.meta.id == secret.meta.id {
+                            // Retry-safe no-op: the slot already holds THIS SAME credential
+                            // (matched by its own id, never reused across mints). This is not a
+                            // genuine second mint attempt — it is `with_conn`'s automatic
+                            // reconnect-and-retry replaying this whole closure after a connection
+                            // blip dropped the reply for an EXEC that had already committed
+                            // server-side. Erroring here would report failure for a write that, in
+                            // fact, already fully succeeded.
+                            pipe.atomic();
+                            return pipe.query(c);
+                        }
+                        // Slot occupied by a DIFFERENT live credential — an explicit mint into it
+                        // would silently destroy a working credential mid-overlap-window. Fail
+                        // loud.
                         return Err(redis::RedisError::from((
                             redis::ErrorKind::Client,
                             "put_credential: slot holds a live credential; revoke it first",
                         )));
                     }
                     old_pub = Some(cur.meta.public_id);
+                    old_id = Some(cur.meta.id);
                 }
                 // UNIQUE(kind, public_id), enforced by an actual read-and-check (not a discarded
                 // SETNX): if some OTHER slot already holds this public_id, reject before writing
@@ -954,6 +1008,19 @@ impl Store for RedisStore {
                 if let Some(old_pub) = &old_pub {
                     if *old_pub != secret.meta.public_id {
                         pipe.del(cred_pub_key(&secret.meta.kind, old_pub)).ignore();
+                    }
+                }
+                if let Some(old_id) = &old_id {
+                    // Reclaiming this slot with a DIFFERENT credential id: the previous occupant's
+                    // `cred:id:<old_id>` pointer would otherwise keep resolving to this slot
+                    // forever, now holding someone else's row. Left alive, a later call to
+                    // `revoke_credential(old_id)` (an idempotent-retry, or simply a caller that
+                    // still has the old id) would revoke and secret-wipe the NEW, unrelated
+                    // occupant instead of being the no-op the trait's contract promises for a dead
+                    // id. Delete it in the same atomic pipe as the reclaim so the two writes are
+                    // never observed apart.
+                    if *old_id != secret.meta.id {
+                        pipe.del(cred_id_key(old_id)).ignore();
                     }
                 }
                 pipe.set(&pub_key, &slot_ptr).ignore();
@@ -998,7 +1065,24 @@ impl Store for RedisStore {
                 &[key_row.as_str(), row_key.as_str(), pub_key.as_str()],
                 |c, pipe| {
                     let pub_holder: Option<String> = c.get(&pub_key)?;
-                    if pub_holder.is_some() {
+                    if let Some(holder) = &pub_holder {
+                        if *holder == slot_ptr {
+                            // Possibly retry-safe: the public_id already points at THIS slot. This
+                            // only happens for a genuinely fresh mint if `with_conn`'s automatic
+                            // reconnect-and-retry is replaying this whole closure after a
+                            // connection blip dropped the reply for an EXEC that had already
+                            // committed server-side — so confirm by id before treating it as a
+                            // no-op rather than a real collision.
+                            let existing_row: Option<String> = c.get(&row_key)?;
+                            let same = existing_row
+                                .as_deref()
+                                .and_then(|r| serde_json::from_str::<CredentialSecret>(r).ok())
+                                .is_some_and(|cur| cur.meta.id == secret.meta.id);
+                            if same {
+                                pipe.atomic();
+                                return pipe.query(c);
+                            }
+                        }
                         return Err(redis::RedisError::from((
                             redis::ErrorKind::Client,
                             "put_key_with_credential: public_id already claimed",

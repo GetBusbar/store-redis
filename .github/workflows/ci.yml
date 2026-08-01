@@ -71,8 +71,8 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: cargo test -p busbar-store-redis -- --ignored migrate_refuses_to_wipe_non_legacy_namespace_with_missing_marker
+      - name: cargo test -p busbar-store-redis -- --ignored wipes_the_entire_namespace_destructively
         working-directory: store-redis-repo/store-redis
         env:
           REDIS_URL: redis://localhost:6379/0
-        run: cargo test -- --ignored --test-threads=1 migrate_refuses_to_wipe_non_legacy_namespace_with_missing_marker
+        run: cargo test -- --ignored --test-threads=1 wipes_the_entire_namespace_destructively

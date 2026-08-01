@@ -110,7 +110,13 @@ fn vk(id: &str) -> VirtualKey {
 
 fn cred_meta(key_id: &str, public_id: &str, slot: u8) -> CredentialMeta {
     CredentialMeta {
-        id: format!("cred_{key_id}_{slot}"),
+        // Includes `public_id`, not just `key_id`/`slot`: in production a credential's `id` is a
+        // fresh UUID per mint, unique regardless of which slot it lands in (see
+        // `revoke_by_a_reclaimed_slots_old_id_must_not_touch_the_new_occupant`'s doc) — two
+        // DIFFERENT credentials must never share a fixture-derived id just because they target the
+        // same (key_id, slot), or a test exercising "a different credential collides with a live
+        // slot" stops being realistic.
+        id: format!("cred_{key_id}_{slot}_{public_id}"),
         key_id: key_id.to_string(),
         kind: "sigv4".to_string(),
         slot,
@@ -429,6 +435,51 @@ fn put_credential_rejects_a_live_slot_but_allows_reclaiming_a_revoked_one() {
 }
 
 #[test]
+fn revoke_by_a_reclaimed_slots_old_id_must_not_touch_the_new_occupant() {
+    // A minted credential's `id` is generated fresh per mint (a UUID in production) -- it is NEVER
+    // reused, even when the SLOT it occupies is later reclaimed by a different credential after a
+    // revoke. `put_credential`'s slot-reclaim path must therefore invalidate the PREVIOUS
+    // occupant's own `cred:id:<id>` pointer, not just its `cred:pub:<public_id>` pointer -- else
+    // that stale pointer keeps resolving to the slot, which now holds someone else's live
+    // credential. A late/duplicate `revoke_credential(old_id)` call (idempotent-retry shaped, or
+    // simply a caller that held on to the old id) would then revoke and secret-wipe the WRONG,
+    // currently-live credential instead of being the no-op the trait's "Idempotent" contract
+    // promises for an already-gone id.
+    let Some(store) = live_store() else { return };
+    let key_id = uid("vk_reclaim");
+    let key = vk(&key_id);
+
+    let mut c0 = cred(&key_id, &uid("AKIA_OLD"), 0);
+    c0.meta.id = uid("cred_old");
+    store.put_key_with_credential(&key, &c0).unwrap();
+    store.revoke_credential(&c0.meta.id, "rotated").unwrap();
+
+    // A brand-new credential, with its OWN distinct id, reclaims the now-revoked slot.
+    let mut c1 = cred(&key_id, &uid("AKIA_NEW"), 0);
+    c1.meta.id = uid("cred_new");
+    store.put_credential(&c1).unwrap();
+
+    // A stale/duplicate revoke against the OLD id must be a no-op -- it must NOT reach into the
+    // slot (now occupied by c1) and revoke/secret-wipe the new, live credential.
+    store.revoke_credential(&c0.meta.id, "stale retry").unwrap();
+
+    let live = store
+        .lookup_credential_secret("sigv4", &c1.meta.public_id)
+        .unwrap()
+        .expect("the reclaiming credential must still resolve by its own public_id");
+    assert!(
+        live.meta.revoked_at.is_none(),
+        "a revoke against the OLD credential's id must not revoke the NEW occupant of its \
+         reclaimed slot"
+    );
+    assert_ne!(
+        live.secret, "",
+        "a revoke against the OLD credential's id must not destroy the NEW occupant's secret \
+         material"
+    );
+}
+
+#[test]
 fn public_id_uniqueness_is_enforced_across_slots() {
     let Some(store) = live_store() else { return };
     let key_id = uid("vk_uniq");
@@ -554,6 +605,106 @@ fn put_key_with_credential_writes_both_or_neither() {
         .is_some());
 }
 
+/// `with_conn` (used by `put_credential`) is documented "Safe only for READ / idempotent ops," but
+/// automatically reconnects-and-retries on any connection-level error (`is_timeout()` /
+/// `is_io_error()` / `is_connection_dropped()`) by re-running the ENTIRE transaction closure. If a
+/// connection blip drops the reply AFTER Redis has already committed the EXEC server-side, that
+/// retry replays `put_credential` with the SAME `CredentialSecret` against a slot that now already
+/// holds it — exactly the scenario this test simulates directly (without needing to sever a real
+/// TCP connection): calling `put_credential` twice in a row with the identical secret must be a
+/// safe no-op, not the "slot holds a live credential" error a genuinely different mint would
+/// correctly get. Without the retry-safety check, this call incorrectly reports failure for a
+/// credential that is, in fact, already correctly and fully written.
+#[test]
+fn put_credential_replayed_with_the_same_credential_id_is_a_retry_safe_no_op() {
+    let Some(store) = live_store() else { return };
+    let key_id = uid("vk_replay");
+    let public_id = uid("AKIA_REPLAY");
+    let key = vk(&key_id);
+    let c = cred(&key_id, &public_id, 0);
+    store.put_key_with_credential(&key, &c).unwrap();
+
+    // Replay the SAME put_credential call (same meta.id) — simulates `with_conn`'s reconnect
+    // retry replaying this closure after the first attempt's EXEC actually landed but its ack
+    // was lost.
+    assert!(
+        store.put_credential(&c).is_ok(),
+        "replaying put_credential with the SAME credential id (its own already-committed write) \
+         must be a retry-safe no-op, not an error"
+    );
+    let live = store
+        .lookup_credential_secret("sigv4", &public_id)
+        .unwrap()
+        .expect("credential must still resolve after the replayed call");
+    assert!(live.meta.revoked_at.is_none());
+    assert_ne!(live.secret, "", "the replay must not have wiped the secret");
+}
+
+/// Same retry-safety class as above, for `put_key_with_credential`'s public_id occupancy check.
+#[test]
+fn put_key_with_credential_replayed_with_the_same_credential_id_is_a_retry_safe_no_op() {
+    let Some(store) = live_store() else { return };
+    let key_id = uid("vk_kwc_replay");
+    let public_id = uid("AKIA_KWC_REPLAY");
+    let key = vk(&key_id);
+    let c = cred(&key_id, &public_id, 0);
+    store.put_key_with_credential(&key, &c).unwrap();
+
+    // Replay the SAME call — simulates the reconnect-retry replaying an already-committed mint.
+    assert!(
+        store.put_key_with_credential(&key, &c).is_ok(),
+        "replaying put_key_with_credential with the SAME credential id (its own already-committed \
+         write) must be a retry-safe no-op, not a 'public_id already claimed' error"
+    );
+    let live = store
+        .lookup_credential_secret("sigv4", &public_id)
+        .unwrap()
+        .expect("credential must still resolve after the replayed call");
+    assert_ne!(live.secret, "", "the replay must not have wiped the secret");
+}
+
+/// `delete_key`'s credential-row cleanup silently swallows a decode failure on a single
+/// credential row (`if let Ok(Some(raw)) = c.get(...)`  / nested `if let Ok(cred) = ...`):
+/// if a row is corrupt, its `cred:pub:*`/`cred:id:*` reverse-lookup pointers are never cleaned up,
+/// yet the row itself is still deleted and the surrounding `delete_key` call still reports success
+/// — silently violating the trait's own "destroy every credential row + pointers" contract while
+/// claiming to have done so. This directly contradicts this same file's stated philosophy
+/// elsewhere (`list_metering`: "a malformed value must not silently ... under-report"). The
+/// correct behavior is to fail the whole (atomic) delete_key call loudly, matching every other
+/// decode path in this crate, rather than reporting success while leaving a dangling pointer that
+/// permanently blocks that public_id from ever being reused.
+#[test]
+fn delete_key_fails_loud_on_a_corrupt_credential_row_instead_of_orphaning_pointers() {
+    let Some(store) = live_store() else { return };
+    let key_id = uid("vk_corrupt");
+    let public_id = uid("AKIA_CORRUPT");
+    let key = vk(&key_id);
+    let c = cred(&key_id, &public_id, 0);
+    store.put_key_with_credential(&key, &c).unwrap();
+
+    // Corrupt the credential row directly, bypassing the trait — simulates operator-side data
+    // corruption / a schema-drift bug, not something reachable through this crate's own API.
+    store
+        .with_conn(|conn| conn.set::<_, _, ()>(cred_row_key(&key_id, "sigv4", 0), "not json"))
+        .unwrap();
+
+    let result = store.delete_key(&key_id);
+    // Clean up the corrupted row ourselves (bypassing the trait, same as we corrupted it): this
+    // suite shares ONE long-lived Redis instance with no per-test wipe (see `live_store()`'s doc),
+    // and `delete_key` correctly refusing to touch the corrupt row means it is still sitting there
+    // for every other concurrently- or later-running test that scans all credentials (e.g.
+    // `list_credentials_since`) to trip over — a real, malformed row is exactly what THIS test
+    // means to exercise, not something later tests should have to survive.
+    store
+        .with_conn(|conn| conn.del::<_, ()>(cred_row_key(&key_id, "sigv4", 0)))
+        .unwrap();
+    assert!(
+        result.is_err(),
+        "delete_key must fail loudly on a corrupt credential row rather than silently reporting \
+         success while orphaning that row's reverse-lookup pointers"
+    );
+}
+
 // ── Metering: field rename + new fields ─────────────────────────────────────────────────────
 
 #[test]
@@ -620,6 +771,61 @@ fn metering_attribution_is_first_write_wins() {
     assert_eq!(rows[0].pricing_version, "v1");
     // But the counters still accumulate normally.
     assert_eq!(rows[0].requests, 2);
+}
+
+#[test]
+fn metering_row_identity_does_not_collide_across_a_delimiter_character() {
+    // `metering_row`'s key is `key_id|model|provider` joined with a bare, unescaped `|`. A model
+    // or provider name containing `|` (an operator-authored config value -- lane/model names are
+    // NOT restricted to a fixed charset anywhere in this crate or its callers) lets two otherwise
+    // DISTINCT (key_id, model, provider) triples collide onto the same Redis row: here
+    // `("k", "a|b", "p")` and `("k", "a", "b|p")` both join to `"k|a|b|p"`. Two logically separate
+    // metering rows would then merge their HINCRBY'd token/request counters into one -- a billing
+    // correctness bug, not just a cosmetic key-name wart.
+    let Some(store) = live_store() else { return };
+    let bucket = unique_bucket(20260802);
+    let key_id = uid("vk_delim");
+
+    store
+        .add_metering(&MeteringDelta {
+            key_id: key_id.clone(),
+            bucket,
+            model: "a|b".to_string(),
+            provider: "p".to_string(),
+            tokens_input: 100,
+            tokens_output: 0,
+            tokens_cache_read: 0,
+            tokens_cache_write: 0,
+            requests: 1,
+            billable_requests: 1,
+            key_group_at_use: "g".to_string(),
+            pricing_version: "v1".to_string(),
+        })
+        .unwrap();
+    store
+        .add_metering(&MeteringDelta {
+            key_id: key_id.clone(),
+            bucket,
+            model: "a".to_string(),
+            provider: "b|p".to_string(),
+            tokens_input: 7,
+            tokens_output: 0,
+            tokens_cache_read: 0,
+            tokens_cache_write: 0,
+            requests: 1,
+            billable_requests: 1,
+            key_group_at_use: "g".to_string(),
+            pricing_version: "v1".to_string(),
+        })
+        .unwrap();
+
+    let rows = store.list_metering(bucket).unwrap();
+    assert_eq!(
+        rows.len(),
+        2,
+        "two distinct (key_id, model, provider) triples must never merge into one metering row, \
+         even when a component contains the internal join delimiter"
+    );
 }
 
 // ── Startup assertion ────────────────────────────────────────────────────────────────────────
