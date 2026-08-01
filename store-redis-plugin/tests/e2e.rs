@@ -217,6 +217,7 @@ fn load_and_exercise_redis_plugin_bad_config_fails_over_abi() {
         .err()
         .expect("an unparseable redis url must fail to load, not silently succeed");
     assert!(
-        err.contains("valkey plugin: failed to connect"),        "expected the plugin's own connect-failure context, got: {err}"
+        err.contains("valkey plugin: failed to connect"),
+        "expected the plugin's own connect-failure context, got: {err}"
     );
 }

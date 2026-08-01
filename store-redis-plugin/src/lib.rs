@@ -5,7 +5,8 @@
 //! exporting the store C ABI. Build it, drop the resulting `.so`/`.dll`/`.dylib` into the engine's
 //! plugins folder, and set `store: { module: valkey, settings: { url: "redis://..." } }`; the engine
 //! loads it in-process at boot. One Valkey instance behind a fleet of busbar nodes means shared
-//! virtual keys, credentials, budgets, usage, and audit across the cluster.//!
+//! virtual keys, credentials, budgets, usage, and audit across the cluster.
+//!
 //! All the KV modeling lives in the `busbar-store-redis` `lib` crate (renamed on the outside to
 //! "Valkey" everywhere it's user-facing; the underlying crate/type names — `RedisStore`, the `redis`
 //! driver dependency — are unchanged, since the wire protocol itself is identical between Redis and
@@ -25,7 +26,8 @@ use std::time::Duration;
 /// The engine passes `store.settings` verbatim as this JSON config (see the boot store-load),
 /// mirroring how the Postgres plugin receives its libpq URL. `connect_timeout_ms` is optional
 /// (defaults to `busbar-store-redis`'s own default, currently 10s); it bounds the initial connect
-/// so a blackholed/firewalled instance fails fast at boot instead of wedging it indefinitely.fn open(cfg: &str) -> Result<Box<dyn Store>, String> {
+/// so a blackholed/firewalled instance fails fast at boot instead of wedging it indefinitely.
+fn open(cfg: &str) -> Result<Box<dyn Store>, String> {
     let v: serde_json::Value = if cfg.trim().is_empty() {
         serde_json::Value::Object(Default::default())
     } else {
@@ -38,7 +40,8 @@ use std::time::Duration;
         Some(ms) => RedisStore::connect_with_timeout(url, Duration::from_millis(ms)),
         None => RedisStore::connect(url),
     }
-    .map_err(|e| format!("valkey plugin: failed to connect: {}", e.0))?;    Ok(Box::new(store))
+    .map_err(|e| format!("valkey plugin: failed to connect: {}", e.0))?;
+    Ok(Box::new(store))
 }
 
 busbar_plugin_sdk::export_store_plugin!(open);
