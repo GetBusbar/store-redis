@@ -15,23 +15,25 @@ name: ci
 env:
   # Same BUSBAR_REF convention ci.yml/release.yml elsewhere establish for the sibling path
   # dependency (busbar-api) this crate needs — INTERIM until busbarAI is public. Update to `main`
-  # once busbar 1.5.0 ships.
-  BUSBAR_REF: 1.5.0-dev
+  # once busbar 1.5.0 ships. Repointed from the stale `1.5.0-dev` (which predates this cycle's
+  # generic-credentials redesign entirely) to `dev`, where that redesign actually landed.
+  BUSBAR_REF: dev
 
 on:
   push:
-    branches: [main]
+    branches: [main, dev]
   pull_request:
-    branches: [main]
+    branches: [main, dev]
 
 jobs:
   ci:
-    uses: GetBusbar/busbar/.github/workflows/plugin-ci.yml@1.5.0-dev
+    uses: GetBusbar/busbar/.github/workflows/plugin-ci.yml@dev
     with:
       plugin_crate: busbar-store-redis-plugin
       plugin_kind: store
       plugin_alias: redis
       service: redis
+      busbar_ref: dev
 
   # migrate()'s destructive-wipe test (store-redis/src/tests.rs) SCAN+DELETEs the ENTIRE busbar:*
   # namespace on whatever live Redis REDIS_URL points at — it is #[ignore]'d and must run ALONE,
