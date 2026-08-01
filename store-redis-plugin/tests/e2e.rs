@@ -28,6 +28,9 @@
 use busbar_api::{ModelTokens, Store, TierTokens, UsageLedger, VirtualKey};
 use busbar_plugin_loader::{load_store, plugin_library_filename};
 use busbar_store_redis::RedisStore;
+use std::path::PathBuf;
+use std::process::{Child, Command, Stdio};
+use std::time::{Duration, Instant};
 
 /// Locate the built `busbar_store_redis_plugin` cdylib in the target dir, derived from the test
 /// binary's own path (robust to a custom `CARGO_TARGET_DIR`). `None` if it hasn't been built —
@@ -220,4 +223,424 @@ fn load_and_exercise_redis_plugin_bad_config_fails_over_abi() {
         err.contains("valkey plugin: failed to connect"),
         "expected the plugin's own connect-failure context, got: {err}"
     );
+}
+
+// ── THE REAL "prod ready" bar: install over the real admin HTTP API, exercise it, verify ──────
+//
+// Everything above loads the plugin via `busbar_plugin_loader::load_store()` — a direct Rust
+// function call no real end user ever makes. `admin_api_installs_the_redis_plugin_and_writes_land_in_real_redis`
+// instead drives an ACTUAL `busbar` binary the way an operator (or CI's own INSTALL-AND-SERVE
+// step, see busbarAI's `.github/workflows/plugin-ci.yml`) does:
+//
+//   1. Pack the built cdylib into a real tarball with the real `busbar-plugin-pack` tool.
+//   2. Boot a real `busbar` process (admin listener up, no redis plugin loaded yet).
+//   3. POST the base64 tarball to `POST /api/v1/admin/plugins` — the real runtime-install path
+//      (`crates/busbar/src/admin/v1/json/handlers.rs::install_plugin`) — and confirm 201.
+//   4. `PUT /api/v1/admin/config/settings` to set `store.module` to the freshly-installed plugin,
+//      persisted; `POST /api/v1/admin/restart` to apply it (store-module changes are documented
+//      restart-to-apply, never a hot swap) — then actually restart the process, since busbar's own
+//      restart deliberately does not self-respawn (a supervisor's job, which this test plays).
+//   5. Confirm the restarted process picked up the plugin as its active store module.
+//   6. Do REAL WORK through the running instance: `POST /api/v1/admin/keys` with
+//      `issue_aws_credential: true` — the one and only admin-HTTP path that mints BOTH a virtual
+//      key AND a credential in one call (there is no separate `/keys/{id}/credentials` endpoint;
+//      confirmed by reading `crates/busbar/src/admin/v1/json/mod.rs`'s full route table).
+//   7. INDEPENDENTLY verify both rows physically landed in the real Redis two ways: (a) the typed
+//      `RedisStore`/`Store` trait — a code path that never touches the plugin, the C ABI, the
+//      loader, or the HTTP admin surface at all; and (b) a raw `redis::Client` GET of the exact
+//      key bytes (`busbar:key:<id>`) — proof independent even of `busbar-store-redis`'s own
+//      encode/decode path, the strongest verification available short of `redis-cli` itself.
+//
+// This is the first test of this shape in either sibling plugin repo (store-postgres's own
+// `load_and_exercise_postgres_plugin_via_file_drop` uses the FILE-DROP mechanism, not the admin
+// API — see that file's own module doc) — there is no existing pattern to mirror beyond CI's own
+// bash INSTALL-AND-SERVE script, which this ports into a real, CI-gated Rust test.
+
+/// RAII guard for a spawned child process: kills and reaps it on drop, including when a panic
+/// unwinds partway through the test.
+struct ChildGuard(Child);
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// The sibling busbarAI checkout's root — same convention this repo's Cargo.toml path deps and
+/// store-postgres's own `e2e.rs` already use.
+fn busbarai_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../busbarAI")
+        .canonicalize()
+        .expect("sibling busbarAI checkout must exist (see Cargo.toml path deps)")
+}
+
+/// Build (once, cached by cargo) the real `busbar` and `busbar-plugin-pack` binaries from the
+/// sibling busbarAI checkout — never a fixture, never a stub.
+fn build_real_binaries() -> (PathBuf, PathBuf) {
+    let root = busbarai_root();
+    let status = Command::new("cargo")
+        .args([
+            "build",
+            "--release",
+            "-p",
+            "busbar",
+            "-p",
+            "busbar-plugin-pack",
+        ])
+        .current_dir(&root)
+        .status()
+        .expect("run cargo build for busbar + busbar-plugin-pack");
+    assert!(
+        status.success(),
+        "building the real busbar + busbar-plugin-pack binaries must succeed"
+    );
+    (
+        root.join("target/release/busbar"),
+        root.join("target/release/busbar-plugin-pack"),
+    )
+}
+
+/// A free-at-the-moment localhost port (bind-then-drop; a TOCTOU race is possible in principle
+/// but is the standard, accepted pattern for test port allocation and hasn't been a problem for
+/// the sibling repos' own equivalents).
+fn free_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .expect("bind an ephemeral port")
+        .local_addr()
+        .expect("read local addr")
+        .port()
+}
+
+fn poll_admin_up(admin: &str, token: &str, client: &reqwest::blocking::Client) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while Instant::now() < deadline {
+        if let Ok(resp) = client
+            .get(format!("{admin}/plugins?type=store"))
+            .bearer_auth(token)
+            .send()
+        {
+            if resp.status().is_success() {
+                return true;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    false
+}
+
+/// Point at a DIFFERENT logical Redis database (index 15, the conventional "spare" db a lot of
+/// Redis tooling reserves for tests) than [`redis_url`]'s own `/0`, which every OTHER test in this
+/// file/crate shares. A real `busbar` boot (unlike a plain `Store` call) HYDRATES every existing
+/// virtual key at startup and validates its `group` against the config's own `groups:` block —
+/// this test's config intentionally defines none, so ANY leftover key from another test sharing
+/// db 0 (e.g. the dlopen persistence test above, which mints a key with `group: "infra"`) makes
+/// boot fail outright with an unrelated "group does not exist" error. Same server, same
+/// `REDIS_URL` host/port, just an isolated `SELECT`ed database — proven the strongest fix short of
+/// a second Redis container (confirmed necessary: this test failed with exactly that pollution
+/// before being pointed at its own db).
+fn admin_test_redis_url(base: &str) -> String {
+    let without_path = match base.rfind('/') {
+        Some(i) if base[..i].contains("://") => &base[..i],
+        _ => base,
+    };
+    format!("{without_path}/15")
+}
+
+#[test]
+fn admin_api_installs_the_redis_plugin_and_writes_land_in_real_redis() {
+    let Some(base_url) = redis_url() else { return };
+    let url = admin_test_redis_url(&base_url);
+    let Some(so_path) = plugin_path() else {
+        eprintln!("skip: redis plugin cdylib not built");
+        return;
+    };
+
+    // Isolate from any prior run against a persistent (non-CI) Redis instance.
+    let direct = RedisStore::connect(&url).expect("connect directly to seed/clean up");
+
+    let (busbar_bin, pack_bin) = build_real_binaries();
+
+    let work = std::env::temp_dir().join(format!(
+        "busbar-redis-admin-e2e-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let plugins_dir = work.join("plugins");
+    std::fs::create_dir_all(&plugins_dir).unwrap();
+
+    // Pack the real cdylib into a real signed-shape tarball, exactly as CI's own SIGNOFF step
+    // does — unsigned locally, same fallback CI's release jobs use without BUSBAR_SIGN_KEY.
+    let tarball = work.join("store-redis.tar.gz");
+    let status = Command::new(&pack_bin)
+        .args([
+            "pack",
+            "--lib",
+            so_path.to_str().unwrap(),
+            "--name",
+            "busbar-store-redis-plugin",
+            "--alias",
+            "redis",
+            "--kind",
+            "store",
+            "--version",
+            "0.0.0-e2e",
+            "--publisher",
+            "busbar",
+            "--description",
+            "e2e admin-api install proof",
+            "--license",
+            "Apache-2.0",
+            "--out",
+            tarball.to_str().unwrap(),
+            "--allow-unsigned",
+        ])
+        .status()
+        .expect("run busbar-plugin-pack");
+    assert!(status.success(), "packing the plugin must succeed");
+
+    let admin_token = format!("e2e-admin-{}-{}", std::process::id(), free_port());
+    let port = free_port();
+    // The admin plane ALWAYS runs on its own listener, separate from `listen` (defaults to
+    // loopback 127.0.0.1:8081 — see `crates/busbar/src/main.rs`'s `admin_listen`/
+    // `build_split_routers_with_limits` doc comments: "production always serves admin on its OWN
+    // listener ... admin and data never share a listener at runtime"). Must be configured
+    // explicitly to an independently-allocated free port, both to avoid colliding with anything
+    // else already bound to 8081 and so concurrent test runs never collide with each other.
+    let admin_port = free_port();
+    let admin = format!("http://127.0.0.1:{admin_port}/api/v1/admin");
+
+    let providers = work.join("providers.yaml");
+    let config = work.join("config.yaml");
+    let overlay = work.join("overlay.json");
+    std::fs::write(
+        &providers,
+        "mock:\n  protocol: anthropic\n  base_url: \"http://127.0.0.1:9\"\n  api_key_env: MOCK_KEY\n",
+    )
+    .unwrap();
+    // No `store:` block at first boot — proves the plugin isn't already active some other way;
+    // the whole point of this test is the RUNTIME install path. `admin_auth` grants Full scope
+    // via a static bearer token (mirrors CI's INSTALL-AND-SERVE step exactly).
+    std::fs::write(
+        &config,
+        format!(
+            "listen: \"127.0.0.1:{port}\"\n\
+             admin_listen: \"127.0.0.1:{admin_port}\"\n\
+             auth:\n  chain: [keys]\n  admin_auth:\n    - admin-tokens: {{ token: {{ env: E2E_ADMIN_TOKEN }} }}\n\
+             plugins:\n  enabled: true\n  dir: {}\n  trust:\n    allow_unsigned: true\n\
+             providers:\n  mock:\n    api_key: {{ env: MOCK_KEY }}\n\
+             models:\n  test-model:\n    provider: mock\n",
+            plugins_dir.display()
+        ),
+    )
+    .unwrap();
+
+    let client = reqwest::blocking::Client::new();
+
+    // Both boots' stdout+stderr are captured to real files (never left as an unread pipe, which
+    // risks the child stalling if it ever writes enough to fill the OS pipe buffer) so a failure
+    // can quote the actual boot log rather than a bare timeout.
+    let spawn = |label: &str| {
+        let log = std::fs::File::create(work.join(format!("busbar-{label}.log")))
+            .expect("create boot log file");
+        let mut cmd = Command::new(&busbar_bin);
+        cmd.env("BUSBAR_CONFIG", &config)
+            .env("BUSBAR_PROVIDERS", &providers)
+            .env("E2E_ADMIN_TOKEN", &admin_token)
+            .env("BUSBAR_STATE_FILE", "")
+            .env("BUSBAR_CONFIG_OVERLAY", &overlay)
+            .stdout(Stdio::from(log.try_clone().expect("clone log fd")))
+            .stderr(Stdio::from(log));
+        cmd.spawn().expect("spawn a real busbar boot")
+    };
+    let boot_log = |label: &str| {
+        std::fs::read_to_string(work.join(format!("busbar-{label}.log"))).unwrap_or_default()
+    };
+
+    // Boot #1: no redis plugin loaded yet.
+    let mut guard = ChildGuard(spawn("1"));
+    assert!(
+        poll_admin_up(&admin, &admin_token, &client),
+        "busbar (boot #1) must come up with the admin listener responsive; log:\n{}",
+        boot_log("1")
+    );
+
+    // THE REAL INSTALL: POST the signed tarball's base64 bytes to /api/v1/admin/plugins.
+    let tarball_bytes = std::fs::read(&tarball).unwrap();
+    use base64::Engine as _;
+    let tarball_b64 = base64::engine::general_purpose::STANDARD.encode(&tarball_bytes);
+    let install_resp = client
+        .post(format!("{admin}/plugins"))
+        .bearer_auth(&admin_token)
+        .json(&serde_json::json!({
+            "file": "busbar-store-redis-plugin-0.0.0-e2e.tar.gz",
+            "tarball_b64": tarball_b64,
+        }))
+        .send()
+        .expect("POST /api/v1/admin/plugins");
+    let install_status = install_resp.status();
+    let install_body: serde_json::Value = install_resp.json().unwrap_or(serde_json::Value::Null);
+    assert_eq!(
+        install_status.as_u16(),
+        201,
+        "expected 201 from POST /api/v1/admin/plugins, got {install_status}: {install_body}"
+    );
+    assert_eq!(
+        install_body.get("name").and_then(|v| v.as_str()),
+        Some("busbar-store-redis-plugin"),
+        "install response must name the installed plugin: {install_body}"
+    );
+
+    // Activate it as the store module, persisted, then restart to apply (store-module changes
+    // are documented restart-to-apply, never a hot swap — confirmed by reading
+    // crates/busbar/src/admin/mod.rs / docs/admin-api.md).
+    let settings_resp = client
+        .put(format!("{admin}/config/settings"))
+        .bearer_auth(&admin_token)
+        .json(&serde_json::json!({
+            "store": { "module": "busbar-store-redis-plugin", "settings": { "url": url } },
+            "persist": true,
+        }))
+        .send()
+        .expect("PUT /api/v1/admin/config/settings");
+    assert!(
+        settings_resp.status().is_success(),
+        "PUT /api/v1/admin/config/settings must succeed: {}",
+        settings_resp.status()
+    );
+
+    let _ = client
+        .post(format!("{admin}/restart"))
+        .bearer_auth(&admin_token)
+        .send();
+
+    // busbar's restart deliberately does not self-respawn — drains and exits, expecting a
+    // supervisor to relaunch it. Play that role: wait for the real exit, then boot #2.
+    let exit_deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Ok(Some(_)) = guard.0.try_wait() {
+            break;
+        }
+        if Instant::now() >= exit_deadline {
+            let _ = guard.0.kill();
+            let _ = guard.0.wait();
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    // Boot #2: same config, now with the persisted overlay naming the redis plugin as the store
+    // module — the real dlopen + Store::connect/migrate path executes here, before the listener
+    // ever answers a request.
+    let guard2 = ChildGuard(spawn("2"));
+    assert!(
+        poll_admin_up(&admin, &admin_token, &client),
+        "busbar (boot #2, with the redis plugin persisted as store.module) must come back up; \
+         log:\n{}",
+        boot_log("2")
+    );
+    assert!(
+        !boot_log("2").contains("does not match any plugin"),
+        "the redis plugin persisted as store.module must resolve to the installed plugin, not \
+         be rejected as unmatched: {}",
+        boot_log("2")
+    );
+
+    let list_resp = client
+        .get(format!("{admin}/plugins?type=store"))
+        .bearer_auth(&admin_token)
+        .send()
+        .expect("GET /api/v1/admin/plugins?type=store");
+    let list_body = list_resp.text().unwrap_or_default();
+    assert!(
+        list_body.contains("busbar-store-redis-plugin"),
+        "the restarted instance must list the installed redis plugin: {list_body}"
+    );
+
+    // REAL WORK: mint a virtual key AND a credential in one admin call (the only admin-HTTP path
+    // that writes a CredentialSecret row — there is no separate /keys/{id}/credentials endpoint).
+    let mint_resp = client
+        .post(format!("{admin}/keys"))
+        .bearer_auth(&admin_token)
+        .json(&serde_json::json!({
+            "name": "e2e-admin-install-verify",
+            "issue_aws_credential": true,
+        }))
+        .send()
+        .expect("POST /api/v1/admin/keys");
+    let mint_status = mint_resp.status();
+    let mint_body: serde_json::Value = mint_resp.json().expect("mint response must be JSON");
+    assert_eq!(
+        mint_status.as_u16(),
+        201,
+        "expected 201 from POST /api/v1/admin/keys, got {mint_status}: {mint_body}"
+    );
+    let key_id = mint_body
+        .get("id")
+        .and_then(|v| v.as_str())
+        .expect("mint response must carry an id")
+        .to_string();
+    assert!(
+        key_id.starts_with("vk_"),
+        "unexpected key id shape: {key_id}"
+    );
+    let access_key_id = mint_body
+        .get("aws_access_key_id")
+        .and_then(|v| v.as_str())
+        .expect("issue_aws_credential:true must return aws_access_key_id")
+        .to_string();
+
+    // Confirm the API's own view sees it (same process, same request path).
+    let get_resp = client
+        .get(format!("{admin}/keys/{key_id}"))
+        .bearer_auth(&admin_token)
+        .send()
+        .expect("GET /api/v1/admin/keys/{id}");
+    assert!(
+        get_resp.status().is_success(),
+        "GET /api/v1/admin/keys/{{id}} must find the just-minted key: {}",
+        get_resp.status()
+    );
+
+    // Now stop the real busbar process before independent verification, so there is no
+    // possibility of racing its own connection/cache.
+    drop(guard2);
+    drop(guard);
+
+    // INDEPENDENT VERIFICATION #1: the typed Store trait, via the plain busbar-store-redis crate
+    // — a code path that never touches the plugin cdylib, the C ABI, the loader, or the admin
+    // HTTP surface at all.
+    let vk = Store::get_key(&direct, &key_id)
+        .expect("get_key via the direct connection")
+        .expect("the virtual key minted through the real admin API must be physically in Redis");
+    assert_eq!(vk.id, key_id);
+    assert_eq!(vk.name, "e2e-admin-install-verify");
+    let creds = Store::list_credentials(&direct, &key_id)
+        .expect("list_credentials via the direct connection");
+    let cred = creds
+        .iter()
+        .find(|c| c.public_id == access_key_id)
+        .expect("the sigv4 credential minted alongside the key must be physically in Redis");
+    assert_eq!(cred.kind, "sigv4");
+    assert_eq!(cred.key_id, key_id);
+
+    // INDEPENDENT VERIFICATION #2: a RAW redis::Client GET of the exact row bytes — proof
+    // independent even of busbar-store-redis's own encode/decode path.
+    let mut raw = redis::Client::open(url.as_str())
+        .and_then(|c| c.get_connection())
+        .expect("raw redis connection for the strongest independent check");
+    let raw_key_row: Option<String> =
+        redis::Commands::get(&mut raw, format!("busbar:key:{key_id}")).unwrap();
+    let raw_key_row = raw_key_row.expect("busbar:key:<id> must be physically present in Redis");
+    assert!(
+        raw_key_row.contains(&key_id) && raw_key_row.contains("e2e-admin-install-verify"),
+        "raw Redis row must contain the minted key's own id and name: {raw_key_row}"
+    );
+
+    let _ = Store::delete_key(&direct, &key_id);
+    let _ = std::fs::remove_dir_all(&work);
 }

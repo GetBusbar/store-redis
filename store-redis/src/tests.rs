@@ -878,6 +878,100 @@ fn connect_refuses_to_start_under_an_eviction_policy() {
     );
 }
 
+// ── migrate() / with_conn retry — mutation-testing coverage gaps (round: cargo-mutants) ───────
+//
+// `cargo-mutants` against `store-redis/src/lib.rs` found four real coverage gaps (no production
+// bug — the existing logic is correct, but nothing in the suite would have caught it breaking):
+//   - `migrate()`'s `version >= SCHEMA_VERSION` early-return guard (mutating `>=` to `<` survived
+//     every existing test) — nothing exercised a SECOND `connect()` against an
+//     already-migrated namespace, which is exactly the case that guard exists to protect: without
+//     it, every reconnect would wipe the entire shared `busbar:*` keyspace.
+//   - `run()`'s `retry && is_connection_error(&e)` match guard (mutating it to `true`, `false`, or
+//     `retry || is_connection_error(&e)` all survived) — nothing exercised either half of the
+//     condition independently: a non-connection error under `retry: true` (must NOT retry) or a
+//     genuine connection-level error (must retry and transparently recover).
+
+/// Kills the `version >= SCHEMA_VERSION` -> `version < SCHEMA_VERSION` mutant: a second
+/// `connect()` (fresh `RedisStore`, fresh internal `migrate()` call) against a namespace already
+/// at the current schema version must be a pure no-op, not a full `busbar:*` wipe.
+#[test]
+fn reconnecting_to_an_already_migrated_namespace_does_not_wipe_existing_data() {
+    let Some(store1) = live_store() else { return };
+    // By the time `store1`'s own `connect()` above returns, the schema marker is unconditionally
+    // at `SCHEMA_VERSION` (every migrate() branch — fresh, already-current, or wipe-then-mark —
+    // ends with the marker set), so this write happens strictly after any wipe `store1`'s own
+    // connect could have triggered.
+    let id = uid("vk_migrate_reconnect");
+    store1.put_key(&vk(&id)).unwrap();
+
+    let url = std::env::var("REDIS_URL").unwrap();
+    let store2 = RedisStore::connect(&url).expect("a second connect() must succeed");
+    assert!(
+        store2.get_key(&id).unwrap().is_some(),
+        "a second connect()/migrate() against an already-migrated namespace must not wipe \
+         existing data (this test's own just-written key, and every concurrently-running test's \
+         data along with it)"
+    );
+}
+
+/// Kills the `true` and `retry || is_connection_error(&e)` mutants: a deterministic
+/// NON-connection error (`WRONGTYPE`, from issuing `LPUSH` against a string-valued key) under
+/// `with_conn` (`retry: true`) must surface directly via the `"command"` error context, never
+/// silently retry — a retry would issue the exact same doomed command again and report it via the
+/// `"retry after reconnect"` context instead, which is what this test would see if the guard ever
+/// stopped checking `is_connection_error` at all.
+#[test]
+fn with_conn_does_not_retry_a_non_connection_error() {
+    let Some(store) = live_store() else { return };
+    let id = uid("vk_wrongtype");
+    let k = format!("busbar:test:wrongtype:{id}");
+    store
+        .with_conn(|c| c.set::<_, _, ()>(&k, "not-a-list"))
+        .unwrap();
+
+    let err = store
+        .with_conn(|c| redis::cmd("LPUSH").arg(&k).arg("x").query::<i64>(c))
+        .expect_err("LPUSH against a string-valued key must fail with WRONGTYPE");
+    assert!(
+        err.0.contains("redis command:"),
+        "a non-connection (WRONGTYPE) error must surface via the 'command' context, never \
+         trigger the reconnect-and-retry path meant only for connection-level errors: {}",
+        err.0
+    );
+
+    store.with_conn(|c| c.del::<_, ()>(&k)).unwrap();
+}
+
+/// Kills the `false` mutant: a genuine connection-level error (the server killing our connection
+/// out from under us — the real-world case `with_conn`'s reconnect-and-retry exists for) must be
+/// transparently recovered, not surfaced to the caller.
+#[test]
+fn with_conn_transparently_reconnects_after_the_connection_is_dropped() {
+    let Some(store) = live_store() else { return };
+    let url = std::env::var("REDIS_URL").unwrap();
+
+    let my_id: i64 = store
+        .with_conn(|c| redis::cmd("CLIENT").arg("ID").query(c))
+        .unwrap();
+    let mut killer = redis::Client::open(url.as_str())
+        .unwrap()
+        .get_connection()
+        .unwrap();
+    let _: () = redis::cmd("CLIENT")
+        .arg("KILL")
+        .arg("ID")
+        .arg(my_id)
+        .query(&mut killer)
+        .expect("kill this store's own connection from an independent connection");
+
+    let id = uid("vk_after_kill");
+    store.put_key(&vk(&id)).expect(
+        "a connection-level error (a killed connection) must trigger transparent \
+         reconnect-and-retry, not surface as a caller-visible failure",
+    );
+    assert!(store.get_key(&id).unwrap().is_some());
+}
+
 // ── Denylist (unchanged shape, still real coverage) ─────────────────────────────────────────
 
 #[test]
