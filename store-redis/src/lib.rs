@@ -630,11 +630,23 @@ impl Store for RedisStore {
                     let row_key = cred_row_key(id, &kind, slot);
                     // Need the row's public_id to clean up its reverse pointer — read it (still
                     // inside the WATCHed transaction closure, so this is consistent with the EXEC).
-                    if let Ok(Some(raw)) = c.get::<_, Option<String>>(&row_key) {
-                        if let Ok(cred) = serde_json::from_str::<CredentialSecret>(&raw) {
-                            pipe.del(cred_pub_key(&kind, &cred.meta.public_id)).ignore();
-                            pipe.del(cred_id_key(&cred.meta.id)).ignore();
-                        }
+                    // A missing row is a legitimate no-op (already gone). A row that IS present but
+                    // fails to decode must abort the whole cascade rather than be silently skipped
+                    // — an `if let Ok(...) = ...` swallow here would still delete the row while
+                    // leaving its `cred:pub:*`/`cred:id:*` reverse pointers permanently dangling,
+                    // reporting `delete_key` as a success despite violating its own "destroy every
+                    // credential row + pointers" contract. Every other decode path in this file
+                    // (key_from_json, cred_from_json, list_metering) propagates a corrupt value as
+                    // an error rather than silently under-delivering; this matches that.
+                    if let Some(raw) = c.get::<_, Option<String>>(&row_key)? {
+                        let cred: CredentialSecret = serde_json::from_str(&raw).map_err(|_| {
+                            redis::RedisError::from((
+                                redis::ErrorKind::Client,
+                                "delete_key: corrupt credential row",
+                            ))
+                        })?;
+                        pipe.del(cred_pub_key(&kind, &cred.meta.public_id)).ignore();
+                        pipe.del(cred_id_key(&cred.meta.id)).ignore();
                     }
                     pipe.del(&row_key).ignore();
                 }
@@ -951,8 +963,20 @@ impl Store for RedisStore {
                         redis::RedisError::from((redis::ErrorKind::Client, "cred decode"))
                     })?;
                     if cur.meta.revoked_at.is_none() {
-                        // Slot occupied by a LIVE credential — an explicit mint into it would
-                        // silently destroy a working credential mid-overlap-window. Fail loud.
+                        if cur.meta.id == secret.meta.id {
+                            // Retry-safe no-op: the slot already holds THIS SAME credential
+                            // (matched by its own id, never reused across mints). This is not a
+                            // genuine second mint attempt — it is `with_conn`'s automatic
+                            // reconnect-and-retry replaying this whole closure after a connection
+                            // blip dropped the reply for an EXEC that had already committed
+                            // server-side. Erroring here would report failure for a write that, in
+                            // fact, already fully succeeded.
+                            pipe.atomic();
+                            return pipe.query(c);
+                        }
+                        // Slot occupied by a DIFFERENT live credential — an explicit mint into it
+                        // would silently destroy a working credential mid-overlap-window. Fail
+                        // loud.
                         return Err(redis::RedisError::from((
                             redis::ErrorKind::Client,
                             "put_credential: slot holds a live credential; revoke it first",
@@ -1041,7 +1065,24 @@ impl Store for RedisStore {
                 &[key_row.as_str(), row_key.as_str(), pub_key.as_str()],
                 |c, pipe| {
                     let pub_holder: Option<String> = c.get(&pub_key)?;
-                    if pub_holder.is_some() {
+                    if let Some(holder) = &pub_holder {
+                        if *holder == slot_ptr {
+                            // Possibly retry-safe: the public_id already points at THIS slot. This
+                            // only happens for a genuinely fresh mint if `with_conn`'s automatic
+                            // reconnect-and-retry is replaying this whole closure after a
+                            // connection blip dropped the reply for an EXEC that had already
+                            // committed server-side — so confirm by id before treating it as a
+                            // no-op rather than a real collision.
+                            let existing_row: Option<String> = c.get(&row_key)?;
+                            let same = existing_row
+                                .as_deref()
+                                .and_then(|r| serde_json::from_str::<CredentialSecret>(r).ok())
+                                .is_some_and(|cur| cur.meta.id == secret.meta.id);
+                            if same {
+                                pipe.atomic();
+                                return pipe.query(c);
+                            }
+                        }
                         return Err(redis::RedisError::from((
                             redis::ErrorKind::Client,
                             "put_key_with_credential: public_id already claimed",

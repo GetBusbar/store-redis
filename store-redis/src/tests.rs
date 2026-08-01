@@ -110,7 +110,13 @@ fn vk(id: &str) -> VirtualKey {
 
 fn cred_meta(key_id: &str, public_id: &str, slot: u8) -> CredentialMeta {
     CredentialMeta {
-        id: format!("cred_{key_id}_{slot}"),
+        // Includes `public_id`, not just `key_id`/`slot`: in production a credential's `id` is a
+        // fresh UUID per mint, unique regardless of which slot it lands in (see
+        // `revoke_by_a_reclaimed_slots_old_id_must_not_touch_the_new_occupant`'s doc) — two
+        // DIFFERENT credentials must never share a fixture-derived id just because they target the
+        // same (key_id, slot), or a test exercising "a different credential collides with a live
+        // slot" stops being realistic.
+        id: format!("cred_{key_id}_{slot}_{public_id}"),
         key_id: key_id.to_string(),
         kind: "sigv4".to_string(),
         slot,
@@ -597,6 +603,106 @@ fn put_key_with_credential_writes_both_or_neither() {
         .lookup_credential_secret("sigv4", &public_id)
         .unwrap()
         .is_some());
+}
+
+/// `with_conn` (used by `put_credential`) is documented "Safe only for READ / idempotent ops," but
+/// automatically reconnects-and-retries on any connection-level error (`is_timeout()` /
+/// `is_io_error()` / `is_connection_dropped()`) by re-running the ENTIRE transaction closure. If a
+/// connection blip drops the reply AFTER Redis has already committed the EXEC server-side, that
+/// retry replays `put_credential` with the SAME `CredentialSecret` against a slot that now already
+/// holds it — exactly the scenario this test simulates directly (without needing to sever a real
+/// TCP connection): calling `put_credential` twice in a row with the identical secret must be a
+/// safe no-op, not the "slot holds a live credential" error a genuinely different mint would
+/// correctly get. Without the retry-safety check, this call incorrectly reports failure for a
+/// credential that is, in fact, already correctly and fully written.
+#[test]
+fn put_credential_replayed_with_the_same_credential_id_is_a_retry_safe_no_op() {
+    let Some(store) = live_store() else { return };
+    let key_id = uid("vk_replay");
+    let public_id = uid("AKIA_REPLAY");
+    let key = vk(&key_id);
+    let c = cred(&key_id, &public_id, 0);
+    store.put_key_with_credential(&key, &c).unwrap();
+
+    // Replay the SAME put_credential call (same meta.id) — simulates `with_conn`'s reconnect
+    // retry replaying this closure after the first attempt's EXEC actually landed but its ack
+    // was lost.
+    assert!(
+        store.put_credential(&c).is_ok(),
+        "replaying put_credential with the SAME credential id (its own already-committed write) \
+         must be a retry-safe no-op, not an error"
+    );
+    let live = store
+        .lookup_credential_secret("sigv4", &public_id)
+        .unwrap()
+        .expect("credential must still resolve after the replayed call");
+    assert!(live.meta.revoked_at.is_none());
+    assert_ne!(live.secret, "", "the replay must not have wiped the secret");
+}
+
+/// Same retry-safety class as above, for `put_key_with_credential`'s public_id occupancy check.
+#[test]
+fn put_key_with_credential_replayed_with_the_same_credential_id_is_a_retry_safe_no_op() {
+    let Some(store) = live_store() else { return };
+    let key_id = uid("vk_kwc_replay");
+    let public_id = uid("AKIA_KWC_REPLAY");
+    let key = vk(&key_id);
+    let c = cred(&key_id, &public_id, 0);
+    store.put_key_with_credential(&key, &c).unwrap();
+
+    // Replay the SAME call — simulates the reconnect-retry replaying an already-committed mint.
+    assert!(
+        store.put_key_with_credential(&key, &c).is_ok(),
+        "replaying put_key_with_credential with the SAME credential id (its own already-committed \
+         write) must be a retry-safe no-op, not a 'public_id already claimed' error"
+    );
+    let live = store
+        .lookup_credential_secret("sigv4", &public_id)
+        .unwrap()
+        .expect("credential must still resolve after the replayed call");
+    assert_ne!(live.secret, "", "the replay must not have wiped the secret");
+}
+
+/// `delete_key`'s credential-row cleanup silently swallows a decode failure on a single
+/// credential row (`if let Ok(Some(raw)) = c.get(...)`  / nested `if let Ok(cred) = ...`):
+/// if a row is corrupt, its `cred:pub:*`/`cred:id:*` reverse-lookup pointers are never cleaned up,
+/// yet the row itself is still deleted and the surrounding `delete_key` call still reports success
+/// — silently violating the trait's own "destroy every credential row + pointers" contract while
+/// claiming to have done so. This directly contradicts this same file's stated philosophy
+/// elsewhere (`list_metering`: "a malformed value must not silently ... under-report"). The
+/// correct behavior is to fail the whole (atomic) delete_key call loudly, matching every other
+/// decode path in this crate, rather than reporting success while leaving a dangling pointer that
+/// permanently blocks that public_id from ever being reused.
+#[test]
+fn delete_key_fails_loud_on_a_corrupt_credential_row_instead_of_orphaning_pointers() {
+    let Some(store) = live_store() else { return };
+    let key_id = uid("vk_corrupt");
+    let public_id = uid("AKIA_CORRUPT");
+    let key = vk(&key_id);
+    let c = cred(&key_id, &public_id, 0);
+    store.put_key_with_credential(&key, &c).unwrap();
+
+    // Corrupt the credential row directly, bypassing the trait — simulates operator-side data
+    // corruption / a schema-drift bug, not something reachable through this crate's own API.
+    store
+        .with_conn(|conn| conn.set::<_, _, ()>(cred_row_key(&key_id, "sigv4", 0), "not json"))
+        .unwrap();
+
+    let result = store.delete_key(&key_id);
+    // Clean up the corrupted row ourselves (bypassing the trait, same as we corrupted it): this
+    // suite shares ONE long-lived Redis instance with no per-test wipe (see `live_store()`'s doc),
+    // and `delete_key` correctly refusing to touch the corrupt row means it is still sitting there
+    // for every other concurrently- or later-running test that scans all credentials (e.g.
+    // `list_credentials_since`) to trip over — a real, malformed row is exactly what THIS test
+    // means to exercise, not something later tests should have to survive.
+    store
+        .with_conn(|conn| conn.del::<_, ()>(cred_row_key(&key_id, "sigv4", 0)))
+        .unwrap();
+    assert!(
+        result.is_err(),
+        "delete_key must fail loudly on a corrupt credential row rather than silently reporting \
+         success while orphaning that row's reverse-lookup pointers"
+    );
 }
 
 // ── Metering: field rename + new fields ─────────────────────────────────────────────────────
