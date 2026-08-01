@@ -429,6 +429,51 @@ fn put_credential_rejects_a_live_slot_but_allows_reclaiming_a_revoked_one() {
 }
 
 #[test]
+fn revoke_by_a_reclaimed_slots_old_id_must_not_touch_the_new_occupant() {
+    // A minted credential's `id` is generated fresh per mint (a UUID in production) -- it is NEVER
+    // reused, even when the SLOT it occupies is later reclaimed by a different credential after a
+    // revoke. `put_credential`'s slot-reclaim path must therefore invalidate the PREVIOUS
+    // occupant's own `cred:id:<id>` pointer, not just its `cred:pub:<public_id>` pointer -- else
+    // that stale pointer keeps resolving to the slot, which now holds someone else's live
+    // credential. A late/duplicate `revoke_credential(old_id)` call (idempotent-retry shaped, or
+    // simply a caller that held on to the old id) would then revoke and secret-wipe the WRONG,
+    // currently-live credential instead of being the no-op the trait's "Idempotent" contract
+    // promises for an already-gone id.
+    let Some(store) = live_store() else { return };
+    let key_id = uid("vk_reclaim");
+    let key = vk(&key_id);
+
+    let mut c0 = cred(&key_id, &uid("AKIA_OLD"), 0);
+    c0.meta.id = uid("cred_old");
+    store.put_key_with_credential(&key, &c0).unwrap();
+    store.revoke_credential(&c0.meta.id, "rotated").unwrap();
+
+    // A brand-new credential, with its OWN distinct id, reclaims the now-revoked slot.
+    let mut c1 = cred(&key_id, &uid("AKIA_NEW"), 0);
+    c1.meta.id = uid("cred_new");
+    store.put_credential(&c1).unwrap();
+
+    // A stale/duplicate revoke against the OLD id must be a no-op -- it must NOT reach into the
+    // slot (now occupied by c1) and revoke/secret-wipe the new, live credential.
+    store.revoke_credential(&c0.meta.id, "stale retry").unwrap();
+
+    let live = store
+        .lookup_credential_secret("sigv4", &c1.meta.public_id)
+        .unwrap()
+        .expect("the reclaiming credential must still resolve by its own public_id");
+    assert!(
+        live.meta.revoked_at.is_none(),
+        "a revoke against the OLD credential's id must not revoke the NEW occupant of its \
+         reclaimed slot"
+    );
+    assert_ne!(
+        live.secret, "",
+        "a revoke against the OLD credential's id must not destroy the NEW occupant's secret \
+         material"
+    );
+}
+
+#[test]
 fn public_id_uniqueness_is_enforced_across_slots() {
     let Some(store) = live_store() else { return };
     let key_id = uid("vk_uniq");
@@ -620,6 +665,61 @@ fn metering_attribution_is_first_write_wins() {
     assert_eq!(rows[0].pricing_version, "v1");
     // But the counters still accumulate normally.
     assert_eq!(rows[0].requests, 2);
+}
+
+#[test]
+fn metering_row_identity_does_not_collide_across_a_delimiter_character() {
+    // `metering_row`'s key is `key_id|model|provider` joined with a bare, unescaped `|`. A model
+    // or provider name containing `|` (an operator-authored config value -- lane/model names are
+    // NOT restricted to a fixed charset anywhere in this crate or its callers) lets two otherwise
+    // DISTINCT (key_id, model, provider) triples collide onto the same Redis row: here
+    // `("k", "a|b", "p")` and `("k", "a", "b|p")` both join to `"k|a|b|p"`. Two logically separate
+    // metering rows would then merge their HINCRBY'd token/request counters into one -- a billing
+    // correctness bug, not just a cosmetic key-name wart.
+    let Some(store) = live_store() else { return };
+    let bucket = unique_bucket(20260802);
+    let key_id = uid("vk_delim");
+
+    store
+        .add_metering(&MeteringDelta {
+            key_id: key_id.clone(),
+            bucket,
+            model: "a|b".to_string(),
+            provider: "p".to_string(),
+            tokens_input: 100,
+            tokens_output: 0,
+            tokens_cache_read: 0,
+            tokens_cache_write: 0,
+            requests: 1,
+            billable_requests: 1,
+            key_group_at_use: "g".to_string(),
+            pricing_version: "v1".to_string(),
+        })
+        .unwrap();
+    store
+        .add_metering(&MeteringDelta {
+            key_id: key_id.clone(),
+            bucket,
+            model: "a".to_string(),
+            provider: "b|p".to_string(),
+            tokens_input: 7,
+            tokens_output: 0,
+            tokens_cache_read: 0,
+            tokens_cache_write: 0,
+            requests: 1,
+            billable_requests: 1,
+            key_group_at_use: "g".to_string(),
+            pricing_version: "v1".to_string(),
+        })
+        .unwrap();
+
+    let rows = store.list_metering(bucket).unwrap();
+    assert_eq!(
+        rows.len(),
+        2,
+        "two distinct (key_id, model, provider) triples must never merge into one metering row, \
+         even when a component contains the internal join delimiter"
+    );
 }
 
 // ── Startup assertion ────────────────────────────────────────────────────────────────────────

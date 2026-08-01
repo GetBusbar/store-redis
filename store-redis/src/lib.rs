@@ -159,10 +159,34 @@ fn parse_model_field(field: &str) -> Option<(&str, &str)> {
 fn metering_set(bucket: u64) -> String {
     format!("busbar:metering:{bucket}")
 }
+/// Escape `\` and the `|` join delimiter (in that order, so the escape character itself round-trips
+/// unambiguously) in one `metering_row` component. Without this, two DISTINCT `(key_id, model,
+/// provider)` triples can collide onto the identical joined string whenever a component contains a
+/// literal `|` — e.g. `("k", "a|b", "p")` and `("k", "a", "b|p")` both join to `"k|a|b|p"` — merging
+/// two logically separate metering rows' HINCRBY'd counters into one. Neither `key_id` (busbar-
+/// generated) nor `model`/`provider` (operator-configured lane names, never restricted to a fixed
+/// charset anywhere upstream) is guaranteed `|`-free, so this is not a theoretical concern.
+fn escape_metering_component(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if matches!(c, '\\' | '|') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
 fn metering_row(bucket: u64, key_id: &str, model: &str, provider: &str) -> String {
-    // `|` joins the composite row identity; it is not a legal character in a model/provider name in
-    // practice, and even if present it only affects the row's own key (never cross-row correctness).
-    format!("busbar:metering:{bucket}:{key_id}|{model}|{provider}")
+    // Each component is escaped before joining (see `escape_metering_component`), so the join is
+    // injective: two different `(key_id, model, provider)` triples can never produce the same row
+    // key, even when a component itself contains `|` or `\`.
+    format!(
+        "busbar:metering:{bucket}:{}|{}|{}",
+        escape_metering_component(key_id),
+        escape_metering_component(model),
+        escape_metering_component(provider)
+    )
 }
 
 /// Clamp a `u64` into `i64` for Redis integer ops (HINCRBY is signed) - a value above `i64::MAX` pins
@@ -921,6 +945,7 @@ impl Store for RedisStore {
             redis::transaction(c, &[row_key.as_str(), pub_key.as_str()], |c, pipe| {
                 let existing: Option<String> = c.get(&row_key)?;
                 let mut old_pub: Option<String> = None;
+                let mut old_id: Option<String> = None;
                 if let Some(raw) = &existing {
                     let cur: CredentialSecret = serde_json::from_str(raw).map_err(|_| {
                         redis::RedisError::from((redis::ErrorKind::Client, "cred decode"))
@@ -934,6 +959,7 @@ impl Store for RedisStore {
                         )));
                     }
                     old_pub = Some(cur.meta.public_id);
+                    old_id = Some(cur.meta.id);
                 }
                 // UNIQUE(kind, public_id), enforced by an actual read-and-check (not a discarded
                 // SETNX): if some OTHER slot already holds this public_id, reject before writing
@@ -958,6 +984,19 @@ impl Store for RedisStore {
                 if let Some(old_pub) = &old_pub {
                     if *old_pub != secret.meta.public_id {
                         pipe.del(cred_pub_key(&secret.meta.kind, old_pub)).ignore();
+                    }
+                }
+                if let Some(old_id) = &old_id {
+                    // Reclaiming this slot with a DIFFERENT credential id: the previous occupant's
+                    // `cred:id:<old_id>` pointer would otherwise keep resolving to this slot
+                    // forever, now holding someone else's row. Left alive, a later call to
+                    // `revoke_credential(old_id)` (an idempotent-retry, or simply a caller that
+                    // still has the old id) would revoke and secret-wipe the NEW, unrelated
+                    // occupant instead of being the no-op the trait's contract promises for a dead
+                    // id. Delete it in the same atomic pipe as the reclaim so the two writes are
+                    // never observed apart.
+                    if *old_id != secret.meta.id {
+                        pipe.del(cred_id_key(old_id)).ignore();
                     }
                 }
                 pipe.set(&pub_key, &slot_ptr).ignore();
