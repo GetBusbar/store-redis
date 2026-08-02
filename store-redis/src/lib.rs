@@ -102,8 +102,21 @@ const REVISION_KEY: &str = "busbar:revision";
 /// `VirtualKey` gains `deleted_at`/`revision`, `delete_key` becomes a tombstone, metering gains
 /// `billable_requests`/`key_group_at_use`/`pricing_version` and renames `tokens_cache_creation` to
 /// `tokens_cache_write`. A pre-v5 namespace is WIPED on connect (1.5.0 unreleased: bump, not migrate).
+///
+/// v6 closes a real billing bug in busbarAI core's `GovState::hydrate_budgets`: that function used
+/// to infer "legacy pre-split row, needs `billable_requests` seeded from `requests`" from the value
+/// shape `billable_requests == 0 && requests > 0` alone — but that exact shape is ALSO what a bucket
+/// looks like after a legitimate full refund (`refund_bucket` decrements `billable_requests` but
+/// never `requests`, by design), so a restart could silently re-bill correctly-refunded fees. Fixed
+/// by removing the value-based guess from `hydrate_budgets` entirely and doing the one-time cutover
+/// HERE instead, at a real schema-version boundary, which by construction happens exactly once ever
+/// per store. v6 wipes any pre-v6 namespace the SAME way the v5 bump did (1.5.0 is STILL unreleased
+/// as of this bump — no real customer has run any pre-v6 build in production, so there is no
+/// genuinely-ambiguous refunded-vs-legacy data anywhere to lose). This is a ONE-TIME safe window: the
+/// NEXT schema bump after 1.5.0 actually ships must NOT reuse this wipe-on-bump shortcut, since real
+/// customer usage/billing history would exist by then and wiping it would itself be a real bug.
 const SCHEMA_KEY: &str = "busbar:schema";
-const SCHEMA_VERSION: i64 = 5;
+const SCHEMA_VERSION: i64 = 6;
 
 /// Internal sentinel: `delete_key`'s outer retry loop uses this to distinguish "credential
 /// membership changed since our watch-set pre-read, restart with a fresh watch set" from a real
@@ -341,10 +354,10 @@ impl RedisStore {
         }
     }
 
-    /// SCHEMA-VERSION BUMP (v5, the generic-credentials redesign; see SCHEMA_VERSION doc): a
-    /// `busbar:*` namespace written by a pre-v5 build is WIPED and re-marked - 1.5.0 is unreleased,
-    /// so this is a bump, never a migration. A fresh namespace is simply marked; a v5 namespace
-    /// passes through untouched.
+    /// SCHEMA-VERSION BUMP (currently v6; see `SCHEMA_VERSION`'s own doc for what each bump did): a
+    /// `busbar:*` namespace written by an older build is WIPED and re-marked - 1.5.0 is unreleased,
+    /// so this is a bump, never a migration. A fresh namespace is simply marked; a namespace already
+    /// at the current version passes through untouched.
     fn migrate(&self) -> StoreResult<()> {
         let marker: Option<i64> = self.with_conn(|c| c.get::<_, Option<i64>>(SCHEMA_KEY))?;
         let version = marker.unwrap_or(0);

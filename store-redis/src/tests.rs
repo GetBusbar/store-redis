@@ -1012,6 +1012,58 @@ fn audit_append_and_list_are_ordered_oldest_first() {
     assert_eq!(tail[1].seq, 3);
 }
 
+/// The v5->v6 SCHEMA_VERSION bump exists to close a real billing bug: `GovState::hydrate_budgets`
+/// (busbarAI core) used to infer "legacy pre-split row" from `billable_requests == 0 && requests >
+/// 0` alone, but that's ALSO the shape of a bucket that was legitimately fully refunded
+/// (`refund_bucket` decrements `billable_requests`, never `requests`) - so a restart could silently
+/// re-bill correctly-refunded fees. The fix moves the one-time cutover here, to a real schema-
+/// version boundary (see `SCHEMA_VERSION`'s doc comment for the full rationale): any pre-v6
+/// namespace is wiped on the next `connect()`, exactly like every prior bump this crate has done,
+/// so `hydrate_budgets` can trust `billable_requests` unconditionally from v6 onward with no more
+/// value-based guessing. `#[ignore]`d for the same reason as `wipes_the_entire_namespace_destructively`:
+/// this seeds real usage data shaped like the refund-collision case, then forces a v5 marker and a
+/// fresh `connect()` (destructively wiping the shared `busbar:*` namespace), so it must run alone.
+#[test]
+#[ignore]
+fn migrate_v5_to_v6_wipes_a_namespace_with_refund_shaped_data() {
+    let Some(store) = live_store() else { return };
+    // Seed data shaped exactly like the ambiguous case: billable_requests == 0, requests > 0 (a
+    // legitimately-refunded window, or - before this fix existed - an unmigrated legacy row).
+    let bucket = "vk_migrate_v6_refund_shaped";
+    let ledger = busbar_api::UsageLedger {
+        requests: 3,
+        billable_requests: 0,
+        models: vec![],
+    };
+    store.put_usage(bucket, 1_700_000_000, &ledger).unwrap();
+    assert_eq!(
+        store.get_usage(bucket, 1_700_000_000).unwrap().requests,
+        3,
+        "precondition: the seeded row is really there before we force the version back"
+    );
+
+    // Force the marker back to v5, simulating a namespace that predates this bump (the real thing
+    // migrate() checks: `version < SCHEMA_VERSION`).
+    store
+        .with_conn(|c| c.set::<_, _, ()>("busbar:schema", 5i64))
+        .unwrap();
+
+    let url = std::env::var("REDIS_URL").unwrap();
+    let store2 = RedisStore::connect(&url).expect("connect() must succeed and run migrate()");
+
+    assert_eq!(
+        store2.get_usage(bucket, 1_700_000_000).unwrap(),
+        busbar_api::UsageLedger::default(),
+        "a namespace at v5 (pre-v6) must be wiped by the v6 bump, including any refund-shaped \
+         usage row - there is no real customer data to preserve at this bump (1.5.0 unreleased)"
+    );
+    let marker: i64 = store2.with_conn(|c| c.get("busbar:schema")).unwrap();
+    assert_eq!(
+        marker, 6,
+        "the marker must land on the current SCHEMA_VERSION after migrate()"
+    );
+}
+
 /// A destructive full-namespace wipe of a REAL Redis/Valkey, gated on the SAME `REDIS_URL` as
 /// every other live test above. `#[ignore]`d so a bare `cargo test` never touches a shared dev
 /// instance by accident.
