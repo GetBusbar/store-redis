@@ -43,7 +43,7 @@ env:
   # extraction gap is a separately tracked blocker, not something this workflow should route
   # around by floating to a moving branch ref. Update this SHA (and re-review) once the extraction
   # lands and 1.5.0-dev stabilizes enough to pin past it.
-  BUSBAR_REF: d59b8e97f016ef2256e068e87db6aa0741bdd4f7
+  BUSBAR_REF: 5b78db9fe0059a08907978f15bcde67e8cd757f9 # v1.5.0 release SHA (GetBusbar/busbar main, 2026-08-02)
 
 jobs:
   # Create the Release first so the parallel per-target upload jobs have something to attach to
