@@ -16,7 +16,7 @@
 #
 # This plugin's own version (the `v*` tag pushed here) is NOT tied to busbar's version number —
 # it is independently versioned starting at 0.5.0 (see README), separate from whichever busbar
-# branch it happens to build against via BUSBAR_REF below.
+# branch it happens to build against via the .busbar-ref file at repo root.
 name: release
 
 on:
@@ -28,22 +28,6 @@ permissions:
   contents: write      # create the Release + upload assets
   id-token: write      # OIDC identity for keyless Sigstore signing (provenance)
   attestations: write  # record the build-provenance attestation
-
-env:
-  # Which busbar commit to check out as the sibling path dependency, used to build
-  # busbar-plugin-pack for the pack+sign step below (which runs while BUSBAR_SIGN_KEY is in
-  # scope). Pinned to a SHA rather than the mutable `1.5.0-dev` branch so a signing job never
-  # builds pack tooling against branch history it hasn't been reviewed against.
-  #
-  # Pinned to d59b8e97f016ef2256e068e87db6aa0741bdd4f7 — the last commit on 1.5.0-dev before
-  # b5cb40f ("Extract store-redis: remove crates/store-redis[-plugin], now GetBusbar/store-redis"),
-  # i.e. the most recent SHA where crates/store-redis (needed only for its own history/context
-  # here, not as a build input — this repo's own store-redis/ now carries that logic) still
-  # existed on that branch. crates/store-redis no longer exists at 1.5.0-dev's current tip; that
-  # extraction gap is a separately tracked blocker, not something this workflow should route
-  # around by floating to a moving branch ref. Update this SHA (and re-review) once the extraction
-  # lands and 1.5.0-dev stabilizes enough to pin past it.
-  BUSBAR_REF: 5b78db9fe0059a08907978f15bcde67e8cd757f9 # v1.5.0 release SHA (GetBusbar/busbar main, 2026-08-02)
 
 jobs:
   # Create the Release first so the parallel per-target upload jobs have something to attach to
@@ -116,11 +100,16 @@ jobs:
         with:
           path: store-redis
 
+      - name: Resolve busbar ref from .busbar-ref
+        id: ref
+        run: echo "sha=$(cut -d' ' -f1 store-redis/.busbar-ref)" >> "$GITHUB_OUTPUT"
+        shell: bash
+
       - name: Checkout busbar (sibling path dependency)
         uses: actions/checkout@v7
         with:
           repository: GetBusbar/busbar
-          ref: ${{ env.BUSBAR_REF }}
+          ref: ${{ steps.ref.outputs.sha }}
           path: busbarAI
 
       - uses: dtolnay/rust-toolchain@stable
