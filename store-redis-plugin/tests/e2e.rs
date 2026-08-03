@@ -32,6 +32,10 @@ use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+/// Fixed ed25519 signing secret (64 hex = 32 bytes) for this e2e test. 1.5.1 requires an
+/// explicit signing key to mint virtual keys; busbar no longer auto-generates one.
+const TEST_SIGNING_KEY: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
 /// Locate the built `busbar_store_redis_plugin` cdylib in the target dir, derived from the test
 /// binary's own path (robust to a custom `CARGO_TARGET_DIR`). `None` if it hasn't been built —
 /// under `cargo test` (which builds the whole package including the cdylib target before running
@@ -430,7 +434,7 @@ fn admin_api_installs_the_redis_plugin_and_writes_land_in_real_redis() {
         format!(
             "listen: \"127.0.0.1:{port}\"\n\
              admin_listen: \"127.0.0.1:{admin_port}\"\n\
-             auth:\n  chain: [keys]\n  admin_auth:\n    - admin-tokens: {{ token: {{ env: E2E_ADMIN_TOKEN }} }}\n\
+             auth:\n  chain: [keys]\n  signing_key: {{ env: BUSBAR_SIGNING_KEY }}\n  admin_auth:\n    - admin-tokens: {{ token: {{ env: E2E_ADMIN_TOKEN }} }}\n\
              plugins:\n  enabled: true\n  dir: {}\n  trust:\n    allow_unsigned: true\n\
              providers:\n  mock:\n    api_key: {{ env: MOCK_KEY }}\n\
              models:\n  test-model:\n    provider: mock\n",
@@ -451,6 +455,7 @@ fn admin_api_installs_the_redis_plugin_and_writes_land_in_real_redis() {
         cmd.env("BUSBAR_CONFIG", &config)
             .env("BUSBAR_PROVIDERS", &providers)
             .env("E2E_ADMIN_TOKEN", &admin_token)
+            .env("BUSBAR_SIGNING_KEY", TEST_SIGNING_KEY)
             .env("BUSBAR_STATE_FILE", "")
             .env("BUSBAR_CONFIG_OVERLAY", &overlay)
             .stdout(Stdio::from(log.try_clone().expect("clone log fd")))
