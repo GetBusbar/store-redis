@@ -17,13 +17,13 @@ env:
   # dependency (busbar-api) this crate needs — INTERIM until busbarAI is public. Update to `main`
   # once busbar 1.5.0 ships. Repointed from the stale `1.5.0-dev` (which predates this cycle's
   # generic-credentials redesign entirely) to `dev`, where that redesign actually landed.
-  BUSBAR_REF: dev
+  BUSBAR_REF: ${{ github.ref_name }}
 
 on:
   push:
-    branches: [main, dev]
+    branches: [main, dev, qa]
   pull_request:
-    branches: [main, dev]
+    branches: [main, dev, qa]
   # Manual trigger. Needed because `gh run rerun` PINS the reusable-workflow SHA:
   # a rerun re-uses the plugin-ci.yml snapshot from the original run, so a fix landing in
   # core's reusable workflow can only be picked up by a NEW run, never by rerunning an old one.
@@ -36,7 +36,7 @@ jobs:
       plugin_kind: store
       plugin_alias: valkey
       service: valkey
-      busbar_ref: dev
+      busbar_ref: ${{ github.ref_name }}
 
   # migrate()'s destructive-wipe test (store-valkey/src/tests.rs) SCAN+DELETEs the ENTIRE busbar:*
   # namespace on whatever live Valkey VALKEY_URL points at — it is #[ignore]'d and must run ALONE,
