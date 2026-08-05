@@ -1,12 +1,12 @@
 # Calls the canonical plugin-ci reusable workflow (GetBusbar/busbar/.github/workflows/plugin-ci.yml)
 # instead of hand-copying build/test/signoff steps here — see that file for what actually runs.
 #
-# busbar-store-redis (the real logic crate) now lives IN THIS REPO (the store-redis/ subdirectory,
-# a same-repo sibling of store-redis-plugin/ — see this repo's root Cargo.toml), not in busbarAI, so
+# busbar-store-valkey (the real logic crate) now lives IN THIS REPO (the store-valkey/ subdirectory,
+# a same-repo sibling of store-valkey-plugin/ — see this repo's root Cargo.toml), not in busbarAI, so
 # the `ci` job below has no extra sibling-TEST command to run: the reusable workflow's own
 # `cargo test` step (working-directory: plugin, i.e. this checkout's root) already exercises
-# busbar-store-redis's own unit tests plus store-redis-plugin's real dlopen ABI e2e test against the
-# `redis` service container above, because `cargo test` on a virtual workspace with no
+# busbar-store-valkey's own unit tests plus store-valkey-plugin's real dlopen ABI e2e test against the
+# `valkey` service container above, because `cargo test` on a virtual workspace with no
 # default-members runs every member by default. This crate's `busbar-api` dependency is STILL a
 # sibling path dependency into busbarAI though (INTERIM until busbarAI is public) — both jobs below
 # need their own busbarAI checkout for that reason.
@@ -29,38 +29,38 @@ jobs:
   ci:
     uses: GetBusbar/busbar/.github/workflows/plugin-ci.yml@dev
     with:
-      plugin_crate: busbar-store-redis-plugin
+      plugin_crate: busbar-store-valkey-plugin
       plugin_kind: store
-      plugin_alias: redis
-      service: redis
+      plugin_alias: valkey
+      service: valkey
       busbar_ref: dev
 
-  # migrate()'s destructive-wipe test (store-redis/src/tests.rs) SCAN+DELETEs the ENTIRE busbar:*
-  # namespace on whatever live Redis REDIS_URL points at — it is #[ignore]'d and must run ALONE,
+  # migrate()'s destructive-wipe test (store-valkey/src/tests.rs) SCAN+DELETEs the ENTIRE busbar:*
+  # namespace on whatever live Valkey VALKEY_URL points at — it is #[ignore]'d and must run ALONE,
   # never concurrently with the `ci` job's own tests against the same shared service container (see
   # that test's own doc comment for the full rationale). It used to run via plugin-ci.yml's
-  # `extra_sibling_test_command` against busbarAI's copy of this crate; now that busbar-store-redis
+  # `extra_sibling_test_command` against busbarAI's copy of this crate; now that busbar-store-valkey
   # lives in this repo instead, it runs here, in its own isolated job against its own dedicated
-  # redis:7 service container.
+  # valkey/valkey:8 service container.
   migrate-destructive-wipe-test:
-    name: migrate() destructive-wipe test (isolated, own redis:7 container)
+    name: migrate() destructive-wipe test (isolated, own valkey/valkey:8 container)
     runs-on: ubuntu-latest
     services:
-      redis:
-        image: redis:7
+      valkey:
+        image: valkey/valkey:8
         ports:
           - 6379:6379
-        # Runs INSIDE the container (it has its own redis-cli — the runner does not); GitHub
+        # Runs INSIDE the container (it has its own valkey-cli — the runner does not); GitHub
         # Actions blocks the job's steps from starting until this reports healthy, so no separate
-        # manual "wait for redis" step is needed or correct here (mirrors plugin-ci.yml's own redis
+        # manual "wait for valkey" step is needed or correct here (mirrors plugin-ci.yml's own valkey
         # service block).
         options: >-
-          --health-cmd "redis-cli ping" --health-interval 5s --health-timeout 5s --health-retries 10
+          --health-cmd "valkey-cli ping" --health-interval 5s --health-timeout 5s --health-retries 10
     steps:
-      - name: Checkout store-redis
+      - name: Checkout store-valkey
         uses: actions/checkout@v7
         with:
-          path: store-redis-repo
+          path: store-valkey-repo
 
       - name: Checkout busbar (sibling path dependency)
         uses: actions/checkout@v7
@@ -71,8 +71,8 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: cargo test -p busbar-store-redis -- --ignored wipes_the_entire_namespace_destructively
-        working-directory: store-redis-repo/store-redis
+      - name: cargo test -p busbar-store-valkey -- --ignored wipes_the_entire_namespace_destructively
+        working-directory: store-valkey-repo/store-valkey
         env:
-          REDIS_URL: redis://localhost:6379/0
+          VALKEY_URL: redis://localhost:6379/0
         run: cargo test -- --ignored --test-threads=1 wipes_the_entire_namespace_destructively

@@ -1,33 +1,33 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Busbar Inc and contributors
 
-//! End-to-end coverage of the `busbar-store-redis-plugin` cdylib loaded over the REAL loader
-//! `load_store` seam against a REAL, live Redis (not a mock, not an in-process fake). This is the
-//! exact seam the engine sees when `store: { module: redis }` is configured: a `Box<dyn Store>`
+//! End-to-end coverage of the `busbar-store-valkey-plugin` cdylib loaded over the REAL loader
+//! `load_store` seam against a REAL, live Valkey (not a mock, not an in-process fake). This is the
+//! exact seam the engine sees when `store: { module: valkey }` is configured: a `Box<dyn Store>`
 //! indistinguishable from a compiled-in store, backed by `dlopen`'d code running the C ABI.
 //!
 //! Unlike a file-backed store (see busbarAI's sqlite plugin end-to-end test, which reopens the
-//! same file), Redis has no "close and reopen the same file" persistence signal to check. Instead
+//! same file), Valkey has no "close and reopen the same file" persistence signal to check. Instead
 //! this proves persistence the way that is actually meaningful for a SHARED backend:
 //!
 //!   1. `dlopen` the plugin, write a key + usage ledger through it over the C ABI, then DROP it
-//!      (which runs `busbar_close`, closing the plugin's own Redis connection).
-//!   2. Independently connect to the SAME Redis instance via the plain `busbar-store-redis`
+//!      (which runs `busbar_close`, closing the plugin's own Valkey connection).
+//!   2. Independently connect to the SAME Valkey instance via the plain `busbar-store-valkey`
 //!      library crate — a code path that never touches the cdylib, the C ABI, or the loader at
 //!      all — and confirm the data is genuinely present.
 //!
 //! If the plugin's `put_key`/`put_usage` over the ABI were silent no-ops (or wrote to some
-//! in-process cache rather than Redis), step 2 would come back empty even though a same-session
+//! in-process cache rather than Valkey), step 2 would come back empty even though a same-session
 //! read-after-write through the plugin looked fine.
 //!
-//! Gated on `REDIS_URL` (a docker `redis:7` GitHub Actions service container in this repo's CI —
+//! Gated on `VALKEY_URL` (a docker `valkey:7` GitHub Actions service container in this repo's CI —
 //! see `.github/workflows/ci.yml`). Skips cleanly when unset locally; under `CI` a missing
-//! `REDIS_URL` is a HARD FAILURE, never a silent skip, so the only over-the-ABI coverage of the
-//! durable Redis store path cannot quietly vanish.
+//! `VALKEY_URL` is a HARD FAILURE, never a silent skip, so the only over-the-ABI coverage of the
+//! durable Valkey store path cannot quietly vanish.
 
 use busbar_api::{ModelTokens, Store, TierTokens, UsageLedger, VirtualKey};
 use busbar_plugin_loader::{load_store, plugin_library_filename};
-use busbar_store_redis::RedisStore;
+use busbar_store_valkey::ValkeyStore;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -36,34 +36,34 @@ use std::time::{Duration, Instant};
 /// explicit signing key to mint virtual keys; busbar no longer auto-generates one.
 const TEST_SIGNING_KEY: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
-/// Locate the built `busbar_store_redis_plugin` cdylib in the target dir, derived from the test
+/// Locate the built `busbar_store_valkey_plugin` cdylib in the target dir, derived from the test
 /// binary's own path (robust to a custom `CARGO_TARGET_DIR`). `None` if it hasn't been built —
 /// under `cargo test` (which builds the whole package including the cdylib target before running
 /// tests) it is always present, so this only guards against unusual invocations.
 fn plugin_path() -> Option<std::path::PathBuf> {
     let exe = std::env::current_exe().ok()?; // .../target/<profile>/deps/e2e-<hash>
     let profile_dir = exe.parent()?.parent()?; // .../target/<profile>
-    let name = plugin_library_filename("busbar_store_redis_plugin");
+    let name = plugin_library_filename("busbar_store_valkey_plugin");
     let candidate = profile_dir.join(&name);
     candidate.exists().then_some(candidate)
 }
 
-/// The live `REDIS_URL`, mirroring `busbar-store-redis`'s own `live_store()` gating discipline
-/// (see busbarAI's `crates/store-redis/src/lib.rs`): skip cleanly when unset LOCALLY, but a
-/// missing `REDIS_URL` under `CI` is a hard failure, not a silent skip — CI provisions the
-/// `redis:7` service container and must set this env var (see `.github/workflows/ci.yml`).
-fn redis_url() -> Option<String> {
-    match std::env::var("REDIS_URL") {
+/// The live `VALKEY_URL`, mirroring `busbar-store-valkey`'s own `live_store()` gating discipline
+/// (see busbarAI's `crates/store-valkey/src/lib.rs`): skip cleanly when unset LOCALLY, but a
+/// missing `VALKEY_URL` under `CI` is a hard failure, not a silent skip — CI provisions the
+/// `valkey:7` service container and must set this env var (see `.github/workflows/ci.yml`).
+fn valkey_url() -> Option<String> {
+    match std::env::var("VALKEY_URL") {
         Ok(url) => Some(url),
         Err(_) if std::env::var_os("CI").is_some() => {
             panic!(
-                "REDIS_URL is unset under CI: the redis:7 service container must provision it \
+                "VALKEY_URL is unset under CI: the valkey:7 service container must provision it \
                  (see .github/workflows/ci.yml). Refusing to silently skip the only over-the-ABI \
-                 coverage of the durable redis store path."
+                 coverage of the durable valkey store path."
             );
         }
         Err(_) => {
-            eprintln!("skip: set REDIS_URL (a live Redis) to run the redis plugin e2e test");
+            eprintln!("skip: set VALKEY_URL (a live Valkey) to run the valkey plugin e2e test");
             None
         }
     }
@@ -101,38 +101,38 @@ fn ledger() -> UsageLedger {
     }
 }
 
-/// END-TO-END PERSISTENCE: dlopen the real redis plugin against a REAL, live Redis, write a key +
+/// END-TO-END PERSISTENCE: dlopen the real valkey plugin against a REAL, live Valkey, write a key +
 /// usage through it over the C ABI, drop the plugin (closing its connection via `RawPlugin`'s
-/// `Drop`, which runs `busbar_close`), then verify the data actually landed in Redis two
+/// `Drop`, which runs `busbar_close`), then verify the data actually landed in Valkey two
 /// independent ways:
-///   1. re-dlopen the SAME cdylib against the SAME `REDIS_URL` — a fresh `busbar_open`/fresh
+///   1. re-dlopen the SAME cdylib against the SAME `VALKEY_URL` — a fresh `busbar_open`/fresh
 ///      `DynStore` instance, proving the plugin itself doesn't just hold an in-memory cache
 ///      across calls.
-///   2. connect to the SAME Redis with `busbar_store_redis::RedisStore::connect` directly — a
+///   2. connect to the SAME Valkey with `busbar_store_valkey::ValkeyStore::connect` directly — a
 ///      totally independent code path that never goes through the cdylib, the C ABI, or the
-///      loader at all — proving the plugin actually wrote real Redis keys, not just satisfying
+///      loader at all — proving the plugin actually wrote real Valkey keys, not just satisfying
 ///      its own in-process round-trip.
 ///
-/// This is the proof that `store: redis` operations over the ABI aren't silently no-ops.
+/// This is the proof that `store: valkey` operations over the ABI aren't silently no-ops.
 #[test]
-fn load_and_exercise_redis_plugin_persists_to_real_redis_across_reopen() {
+fn load_and_exercise_valkey_plugin_persists_to_real_valkey_across_reopen() {
     let Some(path) = plugin_path() else {
-        eprintln!("skip: redis plugin cdylib not built (run under `cargo test`)");
+        eprintln!("skip: valkey plugin cdylib not built (run under `cargo test`)");
         return;
     };
-    let Some(url) = redis_url() else {
+    let Some(url) = valkey_url() else {
         return;
     };
     let cfg = serde_json::json!({ "url": url }).to_string();
 
-    // Isolate from any prior run against a persistent (non-CI) Redis instance.
-    let direct = RedisStore::connect(&url).expect("connect directly to seed/clean up");
+    // Isolate from any prior run against a persistent (non-CI) Valkey instance.
+    let direct = ValkeyStore::connect(&url).expect("connect directly to seed/clean up");
     let _ = Store::delete_key(&direct, "vk_e2e_dlopen");
 
     let vk = key("vk_e2e_dlopen");
 
     {
-        let store = load_store(&path, &cfg).expect("load redis plugin against a real Redis");
+        let store = load_store(&path, &cfg).expect("load valkey plugin against a real Valkey");
         store.put_key(&vk).expect("put_key over the ABI");
         store
             .put_usage("vk_e2e_dlopen", 200, &ledger())
@@ -146,18 +146,18 @@ fn load_and_exercise_redis_plugin_persists_to_real_redis_across_reopen() {
             "vk_e2e_dlopen"
         );
         // `store` (and the `RawPlugin` it wraps) drops here, running `busbar_close` and dropping
-        // the plugin's own `RedisStore`/connection — the data must be durably in Redis after
+        // the plugin's own `ValkeyStore`/connection — the data must be durably in Valkey after
         // this, not just an in-process cache inside the plugin.
     }
 
-    // (1) Re-dlopen the SAME cdylib against the SAME `REDIS_URL`: a fresh plugin instance, fresh
+    // (1) Re-dlopen the SAME cdylib against the SAME `VALKEY_URL`: a fresh plugin instance, fresh
     // `busbar_open`, fresh connection inside the plugin — proves the ABI round-trip isn't relying
     // on the first instance still being alive.
-    let reopened = load_store(&path, &cfg).expect("re-load redis plugin against the same URL");
+    let reopened = load_store(&path, &cfg).expect("re-load valkey plugin against the same URL");
     let got = reopened
         .get_key("vk_e2e_dlopen")
         .expect("get_key after reopen")
-        .expect("the key must survive a full plugin close + reopen against the same Redis");
+        .expect("the key must survive a full plugin close + reopen against the same Valkey");
     assert_eq!(got.group.as_deref(), Some("infra"));
     assert_eq!(got.labels.get("env").map(String::as_str), Some("e2e"));
     let usage = reopened
@@ -170,14 +170,14 @@ fn load_and_exercise_redis_plugin_persists_to_real_redis_across_reopen() {
     assert_eq!((t.input, t.output), (20, 8));
     drop(reopened);
 
-    // (2) Read back through a TOTALLY INDEPENDENT connection — the plain `RedisStore`, used
+    // (2) Read back through a TOTALLY INDEPENDENT connection — the plain `ValkeyStore`, used
     // directly, never touching the cdylib, the C ABI, or `busbar-plugin-loader` at all. If the
     // plugin's `put_key`/`put_usage` over the ABI were silent no-ops (or wrote somewhere other
-    // than the configured Redis), this independent reader would come back empty even though the
+    // than the configured Valkey), this independent reader would come back empty even though the
     // reopen-via-plugin check above passed.
     let direct_key = Store::get_key(&direct, "vk_e2e_dlopen")
         .expect("get_key via the direct connection")
-        .expect("the key must be physically present in Redis, bypassing the plugin");
+        .expect("the key must be physically present in Valkey, bypassing the plugin");
     assert_eq!(direct_key.name, "e2e-dlopen-key");
     assert_eq!(
         direct_key.allowed_scopes,
@@ -187,20 +187,20 @@ fn load_and_exercise_redis_plugin_persists_to_real_redis_across_reopen() {
         .expect("get_usage via the direct connection");
     assert_eq!(
         direct_usage.requests, 5,
-        "usage must be physically present in Redis, not just cached in-process by the plugin"
+        "usage must be physically present in Valkey, not just cached in-process by the plugin"
     );
 
     let _ = Store::delete_key(&direct, "vk_e2e_dlopen");
 }
 
 /// END-TO-END FAILURE: an `open()` config that cannot produce a usable store — malformed JSON, a
-/// config missing `url`, and a `url` Redis itself refuses to parse — surfaces back across the C
-/// ABI as a clean `Err`, never a panic or a silently-succeeded load. Needs no live Redis: every
+/// config missing `url`, and a `url` Valkey itself refuses to parse — surfaces back across the C
+/// ABI as a clean `Err`, never a panic or a silently-succeeded load. Needs no live Valkey: every
 /// case here fails before (or instead of) actually connecting.
 #[test]
-fn load_and_exercise_redis_plugin_bad_config_fails_over_abi() {
+fn load_and_exercise_valkey_plugin_bad_config_fails_over_abi() {
     let Some(path) = plugin_path() else {
-        eprintln!("skip: redis plugin cdylib not built (run under `cargo test`)");
+        eprintln!("skip: valkey plugin cdylib not built (run under `cargo test`)");
         return;
     };
 
@@ -220,9 +220,9 @@ fn load_and_exercise_redis_plugin_bad_config_fails_over_abi() {
         "expected the plugin's own missing-url message, got: {err}"
     );
 
-    let err = load_store(&path, r#"{"url":"not-a-redis-url"}"#)
+    let err = load_store(&path, r#"{"url":"not-a-valkey-url"}"#)
         .err()
-        .expect("an unparseable redis url must fail to load, not silently succeed");
+        .expect("an unparseable valkey url must fail to load, not silently succeed");
     assert!(
         err.contains("valkey plugin: failed to connect"),
         "expected the plugin's own connect-failure context, got: {err}"
@@ -232,12 +232,12 @@ fn load_and_exercise_redis_plugin_bad_config_fails_over_abi() {
 // ── THE REAL "prod ready" bar: install over the real admin HTTP API, exercise it, verify ──────
 //
 // Everything above loads the plugin via `busbar_plugin_loader::load_store()` — a direct Rust
-// function call no real end user ever makes. `admin_api_installs_the_redis_plugin_and_writes_land_in_real_redis`
+// function call no real end user ever makes. `admin_api_installs_the_valkey_plugin_and_writes_land_in_real_valkey`
 // instead drives an ACTUAL `busbar` binary the way an operator (or CI's own INSTALL-AND-SERVE
 // step, see busbarAI's `.github/workflows/plugin-ci.yml`) does:
 //
 //   1. Pack the built cdylib into a real tarball with the real `busbar-plugin-pack` tool.
-//   2. Boot a real `busbar` process (admin listener up, no redis plugin loaded yet).
+//   2. Boot a real `busbar` process (admin listener up, no valkey plugin loaded yet).
 //   3. POST the base64 tarball to `POST /api/v1/admin/plugins` — the real runtime-install path
 //      (`crates/busbar/src/admin/v1/json/handlers.rs::install_plugin`) — and confirm 201.
 //   4. `PUT /api/v1/admin/config/settings` to set `store.module` to the freshly-installed plugin,
@@ -249,11 +249,11 @@ fn load_and_exercise_redis_plugin_bad_config_fails_over_abi() {
 //      `issue_aws_credential: true` — the one and only admin-HTTP path that mints BOTH a virtual
 //      key AND a credential in one call (there is no separate `/keys/{id}/credentials` endpoint;
 //      confirmed by reading `crates/busbar/src/admin/v1/json/mod.rs`'s full route table).
-//   7. INDEPENDENTLY verify both rows physically landed in the real Redis two ways: (a) the typed
-//      `RedisStore`/`Store` trait — a code path that never touches the plugin, the C ABI, the
+//   7. INDEPENDENTLY verify both rows physically landed in the real Valkey two ways: (a) the typed
+//      `ValkeyStore`/`Store` trait — a code path that never touches the plugin, the C ABI, the
 //      loader, or the HTTP admin surface at all; and (b) a raw `redis::Client` GET of the exact
-//      key bytes (`busbar:key:<id>`) — proof independent even of `busbar-store-redis`'s own
-//      encode/decode path, the strongest verification available short of `redis-cli` itself.
+//      key bytes (`busbar:key:<id>`) — proof independent even of `busbar-store-valkey`'s own
+//      encode/decode path, the strongest verification available short of `valkey-cli` itself.
 //
 // This is the first test of this shape in either sibling plugin repo (store-postgres's own
 // `load_and_exercise_postgres_plugin_via_file_drop` uses the FILE-DROP mechanism, not the admin
@@ -334,17 +334,17 @@ fn poll_admin_up(admin: &str, token: &str, client: &reqwest::blocking::Client) -
     false
 }
 
-/// Point at a DIFFERENT logical Redis database (index 15, the conventional "spare" db a lot of
-/// Redis tooling reserves for tests) than [`redis_url`]'s own `/0`, which every OTHER test in this
+/// Point at a DIFFERENT logical Valkey database (index 15, the conventional "spare" db a lot of
+/// Valkey tooling reserves for tests) than [`valkey_url`]'s own `/0`, which every OTHER test in this
 /// file/crate shares. A real `busbar` boot (unlike a plain `Store` call) HYDRATES every existing
 /// virtual key at startup and validates its `group` against the config's own `groups:` block —
 /// this test's config intentionally defines none, so ANY leftover key from another test sharing
 /// db 0 (e.g. the dlopen persistence test above, which mints a key with `group: "infra"`) makes
 /// boot fail outright with an unrelated "group does not exist" error. Same server, same
-/// `REDIS_URL` host/port, just an isolated `SELECT`ed database — proven the strongest fix short of
-/// a second Redis container (confirmed necessary: this test failed with exactly that pollution
+/// `VALKEY_URL` host/port, just an isolated `SELECT`ed database — proven the strongest fix short of
+/// a second Valkey container (confirmed necessary: this test failed with exactly that pollution
 /// before being pointed at its own db).
-fn admin_test_redis_url(base: &str) -> String {
+fn admin_test_valkey_url(base: &str) -> String {
     let without_path = match base.rfind('/') {
         Some(i) if base[..i].contains("://") => &base[..i],
         _ => base,
@@ -353,21 +353,21 @@ fn admin_test_redis_url(base: &str) -> String {
 }
 
 #[test]
-fn admin_api_installs_the_redis_plugin_and_writes_land_in_real_redis() {
-    let Some(base_url) = redis_url() else { return };
-    let url = admin_test_redis_url(&base_url);
+fn admin_api_installs_the_valkey_plugin_and_writes_land_in_real_valkey() {
+    let Some(base_url) = valkey_url() else { return };
+    let url = admin_test_valkey_url(&base_url);
     let Some(so_path) = plugin_path() else {
-        eprintln!("skip: redis plugin cdylib not built");
+        eprintln!("skip: valkey plugin cdylib not built");
         return;
     };
 
-    // Isolate from any prior run against a persistent (non-CI) Redis instance.
-    let direct = RedisStore::connect(&url).expect("connect directly to seed/clean up");
+    // Isolate from any prior run against a persistent (non-CI) Valkey instance.
+    let direct = ValkeyStore::connect(&url).expect("connect directly to seed/clean up");
 
     let (busbar_bin, pack_bin) = build_real_binaries();
 
     let work = std::env::temp_dir().join(format!(
-        "busbar-redis-admin-e2e-{}-{}",
+        "busbar-valkey-admin-e2e-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -379,16 +379,16 @@ fn admin_api_installs_the_redis_plugin_and_writes_land_in_real_redis() {
 
     // Pack the real cdylib into a real signed-shape tarball, exactly as CI's own SIGNOFF step
     // does — unsigned locally, same fallback CI's release jobs use without BUSBAR_SIGN_KEY.
-    let tarball = work.join("store-redis.tar.gz");
+    let tarball = work.join("store-valkey.tar.gz");
     let status = Command::new(&pack_bin)
         .args([
             "pack",
             "--lib",
             so_path.to_str().unwrap(),
             "--name",
-            "busbar-store-redis-plugin",
+            "busbar-store-valkey-plugin",
             "--alias",
-            "redis",
+            "valkey",
             "--kind",
             "store",
             "--version",
@@ -466,7 +466,7 @@ fn admin_api_installs_the_redis_plugin_and_writes_land_in_real_redis() {
         std::fs::read_to_string(work.join(format!("busbar-{label}.log"))).unwrap_or_default()
     };
 
-    // Boot #1: no redis plugin loaded yet.
+    // Boot #1: no valkey plugin loaded yet.
     let mut guard = ChildGuard(spawn("1"));
     assert!(
         poll_admin_up(&admin, &admin_token, &client),
@@ -482,7 +482,7 @@ fn admin_api_installs_the_redis_plugin_and_writes_land_in_real_redis() {
         .post(format!("{admin}/plugins"))
         .bearer_auth(&admin_token)
         .json(&serde_json::json!({
-            "file": "busbar-store-redis-plugin-0.0.0-e2e.tar.gz",
+            "file": "busbar-store-valkey-plugin-0.0.0-e2e.tar.gz",
             "tarball_b64": tarball_b64,
         }))
         .send()
@@ -496,7 +496,7 @@ fn admin_api_installs_the_redis_plugin_and_writes_land_in_real_redis() {
     );
     assert_eq!(
         install_body.get("name").and_then(|v| v.as_str()),
-        Some("busbar-store-redis-plugin"),
+        Some("busbar-store-valkey-plugin"),
         "install response must name the installed plugin: {install_body}"
     );
 
@@ -507,7 +507,7 @@ fn admin_api_installs_the_redis_plugin_and_writes_land_in_real_redis() {
         .put(format!("{admin}/config/settings"))
         .bearer_auth(&admin_token)
         .json(&serde_json::json!({
-            "store": { "module": "busbar-store-redis-plugin", "settings": { "url": url } },
+            "store": { "module": "busbar-store-valkey-plugin", "settings": { "url": url } },
             "persist": true,
         }))
         .send()
@@ -538,19 +538,19 @@ fn admin_api_installs_the_redis_plugin_and_writes_land_in_real_redis() {
         std::thread::sleep(Duration::from_millis(50));
     }
 
-    // Boot #2: same config, now with the persisted overlay naming the redis plugin as the store
+    // Boot #2: same config, now with the persisted overlay naming the valkey plugin as the store
     // module — the real dlopen + Store::connect/migrate path executes here, before the listener
     // ever answers a request.
     let guard2 = ChildGuard(spawn("2"));
     assert!(
         poll_admin_up(&admin, &admin_token, &client),
-        "busbar (boot #2, with the redis plugin persisted as store.module) must come back up; \
+        "busbar (boot #2, with the valkey plugin persisted as store.module) must come back up; \
          log:\n{}",
         boot_log("2")
     );
     assert!(
         !boot_log("2").contains("does not match any plugin"),
-        "the redis plugin persisted as store.module must resolve to the installed plugin, not \
+        "the valkey plugin persisted as store.module must resolve to the installed plugin, not \
          be rejected as unmatched: {}",
         boot_log("2")
     );
@@ -562,8 +562,8 @@ fn admin_api_installs_the_redis_plugin_and_writes_land_in_real_redis() {
         .expect("GET /api/v1/admin/plugins?type=store");
     let list_body = list_resp.text().unwrap_or_default();
     assert!(
-        list_body.contains("busbar-store-redis-plugin"),
-        "the restarted instance must list the installed redis plugin: {list_body}"
+        list_body.contains("busbar-store-valkey-plugin"),
+        "the restarted instance must list the installed valkey plugin: {list_body}"
     );
 
     // REAL WORK: mint a virtual key AND a credential in one admin call (the only admin-HTTP path
@@ -616,12 +616,12 @@ fn admin_api_installs_the_redis_plugin_and_writes_land_in_real_redis() {
     drop(guard2);
     drop(guard);
 
-    // INDEPENDENT VERIFICATION #1: the typed Store trait, via the plain busbar-store-redis crate
+    // INDEPENDENT VERIFICATION #1: the typed Store trait, via the plain busbar-store-valkey crate
     // — a code path that never touches the plugin cdylib, the C ABI, the loader, or the admin
     // HTTP surface at all.
     let vk = Store::get_key(&direct, &key_id)
         .expect("get_key via the direct connection")
-        .expect("the virtual key minted through the real admin API must be physically in Redis");
+        .expect("the virtual key minted through the real admin API must be physically in Valkey");
     assert_eq!(vk.id, key_id);
     assert_eq!(vk.name, "e2e-admin-install-verify");
     let creds = Store::list_credentials(&direct, &key_id)
@@ -629,21 +629,21 @@ fn admin_api_installs_the_redis_plugin_and_writes_land_in_real_redis() {
     let cred = creds
         .iter()
         .find(|c| c.public_id == access_key_id)
-        .expect("the sigv4 credential minted alongside the key must be physically in Redis");
+        .expect("the sigv4 credential minted alongside the key must be physically in Valkey");
     assert_eq!(cred.kind, "sigv4");
     assert_eq!(cred.key_id, key_id);
 
     // INDEPENDENT VERIFICATION #2: a RAW redis::Client GET of the exact row bytes — proof
-    // independent even of busbar-store-redis's own encode/decode path.
+    // independent even of busbar-store-valkey's own encode/decode path.
     let mut raw = redis::Client::open(url.as_str())
         .and_then(|c| c.get_connection())
-        .expect("raw redis connection for the strongest independent check");
+        .expect("raw valkey connection for the strongest independent check");
     let raw_key_row: Option<String> =
         redis::Commands::get(&mut raw, format!("busbar:key:{key_id}")).unwrap();
-    let raw_key_row = raw_key_row.expect("busbar:key:<id> must be physically present in Redis");
+    let raw_key_row = raw_key_row.expect("busbar:key:<id> must be physically present in Valkey");
     assert!(
         raw_key_row.contains(&key_id) && raw_key_row.contains("e2e-admin-install-verify"),
-        "raw Redis row must contain the minted key's own id and name: {raw_key_row}"
+        "raw Valkey row must contain the minted key's own id and name: {raw_key_row}"
     );
 
     let _ = Store::delete_key(&direct, &key_id);

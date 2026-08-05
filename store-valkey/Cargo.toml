@@ -1,21 +1,24 @@
 # SPDX-License-Identifier: Apache-2.0
 [package]
-name = "busbar-store-redis"
+name = "busbar-store-valkey"
 version = "1.0.0"
 publish = false            # internal workspace crate; never goes to crates.io
 edition = "2021"
 rust-version = "1.97"
-description = "The Redis backend for busbar's durable governance store — the shared, multi-node db plugin over a KV data model. Implements busbar_api::Store on a mutex-guarded synchronous redis connection."
+description = "The Valkey backend for busbar's durable governance store — the shared, multi-node db plugin over a KV data model. Implements busbar_api::Store on a mutex-guarded synchronous valkey connection."
 license = "Apache-2.0"
 
 [dependencies]
 # INTERIM: busbarAI isn't public yet, so this is a local path dependency into a sibling checkout of
 # the monorepo. Once busbarAI ships publicly this should become a git (pinned rev/tag) or crates.io
-# dependency instead — same pattern already applied to busbar-plugin-sdk in ../store-redis-plugin.
+# dependency instead — same pattern already applied to busbar-plugin-sdk in ../store-valkey-plugin.
 busbar-api = { path = "../../busbarAI/crates/api" }
-# The SYNCHRONOUS redis client only (no async runtime), with rustls-backed TLS for rediss:// URLs.
-# Trimming default-features keeps the dependency tree small and license-clean (redis + its deps are
-# MIT/Apache/BSD — all already in deny.toml's allow-list) and avoids pulling a second async stack
+# The upstream RESP client, SYNCHRONOUS only (no async runtime), with rustls-backed TLS for
+# rediss:// URLs. NOTE: this is the ONE name in this repo that is deliberately NOT "valkey" — it is
+# an upstream crates.io package still published under its pre-fork name, so it is not ours to
+# rename; the server it talks to is Valkey, and the RESP dialect is the same one Valkey speaks.
+# Trimming default-features keeps the dependency tree small and license-clean (this crate + its deps
+# are MIT/Apache/BSD — all already in deny.toml's allow-list) and avoids pulling a second async stack
 # into the plugin; the rustls backend reuses the single TLS stack the workspace already pins.
 redis = { version = "1", default-features = false, features = ["tls-rustls"] }
 # The rediss:// TLS path builds its rustls config against the PROCESS default crypto provider; this

@@ -8,7 +8,7 @@ requests, or discussions.**
 Instead, report privately through either channel:
 
 - Email **security@getbusbar.com**, or
-- GitHub's [private vulnerability reporting](https://github.com/GetBusbar/store-redis/security/advisories/new)
+- GitHub's [private vulnerability reporting](https://github.com/GetBusbar/store-valkey/security/advisories/new)
   (the **Security** tab on this repository).
 
 Please include:
@@ -20,20 +20,20 @@ Please include:
 
 We aim to **acknowledge your report within 48 hours**, work with you on a fix, and
 coordinate disclosure timing. Confirmed vulnerabilities are published as
-[GitHub Security Advisories](https://github.com/GetBusbar/store-redis/security/advisories),
+[GitHub Security Advisories](https://github.com/GetBusbar/store-valkey/security/advisories),
 through which we request and issue **CVE** identifiers. We credit reporters who wish to be
 credited once a fix is released.
 
 ## Scope
 
-`store-redis` is a `kind: store` busbar plugin: it persists busbar's governance
-data — virtual keys, budgets, usage, and audit rows — in a shared Redis instance
+`store-valkey` is a `kind: store` busbar plugin: it persists busbar's governance
+data — virtual keys, budgets, usage, and audit rows — in a shared Valkey instance
 behind a fleet of busbar nodes. Issues of particular interest include:
 
 - Connection-string (`url`/`rediss://`) handling that could leak credentials
   into logs or error strings.
 - TLS validation gaps in the `rustls`-backed `rediss://` path.
-- Cross-node accrual races: `add_usage` relies on Redis `HINCRBY` for atomic
+- Cross-node accrual races: `add_usage` relies on Valkey `HINCRBY` for atomic
   accumulation — anything that lets concurrent nodes lose or double-count a
   delta is in scope.
 - A load-time config error surfacing as a silent success instead of a clean

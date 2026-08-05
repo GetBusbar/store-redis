@@ -1,16 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Busbar Inc and contributors
 
-//! The **Valkey** (Redis-protocol compatible) backend for busbar's durable governance store — the
+//! The **Valkey** backend for busbar's durable governance store — the
 //! shared, multi-node `db` plugin over a KEY-VALUE data model. Implements `busbar_api::Store` on a
 //! mutex-guarded SYNCHRONOUS connection, depending only on the `busbar-api` contract (plus the
-//! `redis` driver, which speaks the RESP protocol both Valkey and Redis implement identically),
-//! never on the engine.
+//! upstream RESP driver crate, which is still published on crates.io under its pre-fork name and is
+//! therefore the ONE spelling in this repo that is not ours to rename), never on the engine.
 //!
-//! Renamed from `store-redis` (2026-07-31): Redis Inc. moved Redis itself off an OSI-approved
-//! license in 2024; Valkey (the Linux-Foundation-governed BSD-licensed fork) is what the ecosystem
-//! has standardized on since. The wire protocol this crate speaks is unchanged — same driver, same
-//! commands — only the product name and config value (`store.module: valkey`) changed.
+//! Valkey is what busbar ships and documents: the Linux-Foundation-governed, BSD-licensed store the
+//! ecosystem standardized on. The only remnants of the pre-fork name anywhere in this crate are the
+//! upstream driver crate's own name/paths and the `url://` scheme strings that driver parses
+//! (`redis://` / `rediss://`) — both fixed by upstream, neither a busbar-owned identifier.
 //!
 //! ## Schema v5 — the generic-credentials redesign
 //!
@@ -80,7 +80,7 @@ use std::time::Duration;
 /// otherwise wedge engine boot indefinitely. `connect_with_timeout` lets a caller override this.
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
-// ── Key-space helpers (one namespace prefix so a Redis/Valkey shared with other apps never collides) ──
+// ── Key-space helpers (one namespace prefix so a Valkey shared with other apps never collides) ──
 const KEY_PREFIX: &str = "busbar:key:";
 const KEYS_INDEX: &str = "busbar:keys";
 const KEYS_BYREV: &str = "busbar:keys:byrev";
@@ -144,7 +144,7 @@ fn cred_id_key(cred_id: &str) -> String {
     format!("{CRED_ID_PREFIX}{cred_id}")
 }
 
-/// Escape Redis/Valkey glob metacharacters (`*`, `?`, `[`, `]`, and the escape character `\` itself)
+/// Escape Valkey glob metacharacters (`*`, `?`, `[`, `]`, and the escape character `\` itself)
 /// in a value that must match LITERALLY inside a `SCAN MATCH` pattern. Without this, a virtual key id
 /// containing one of these characters lets `delete_key`'s cleanup SCAN match keys belonging to OTHER
 /// buckets/ids that merely share a glob-matching prefix.
@@ -202,7 +202,7 @@ fn metering_row(bucket: u64, key_id: &str, model: &str, provider: &str) -> Strin
     )
 }
 
-/// Clamp a `u64` into `i64` for Redis integer ops (HINCRBY is signed) - a value above `i64::MAX` pins
+/// Clamp a `u64` into `i64` for Valkey integer ops (HINCRBY is signed) - a value above `i64::MAX` pins
 /// to `i64::MAX`, never wraps. Mirrors the SQL backends.
 fn clamp(v: u64) -> i64 {
     i64::try_from(v).unwrap_or(i64::MAX)
@@ -214,7 +214,7 @@ fn read_u64(v: i64) -> u64 {
     v.max(0) as u64
 }
 
-/// Extract the PASSWORD component from a redis URL (`redis://user:pass@host/...` or
+/// Extract the PASSWORD component from a valkey URL (`redis://user:pass@host/...` or
 /// `redis://:pass@host/...`), if any - the secret that must never appear in an error string.
 fn url_password(url: &str) -> Option<String> {
     let rest = url.split("://").nth(1)?;
@@ -228,7 +228,7 @@ fn url_password(url: &str) -> Option<String> {
 
 /// Percent-DECODE a URL component (`%40` -> `@`, `%25` -> `%`). A malformed escape is left verbatim.
 /// Used so the scrub redacts BOTH the raw (as-written-in-URL) and decoded forms of the password -
-/// the redis driver may surface either in an error string (L1).
+/// the valkey driver may surface either in an error string (L1).
 fn percent_decode(s: &str) -> String {
     let bytes = s.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
@@ -273,10 +273,10 @@ fn is_connection_error(e: &redis::RedisError) -> bool {
     e.is_io_error() || e.is_connection_dropped() || e.is_connection_refusal() || e.is_timeout()
 }
 
-/// Valkey (Redis-protocol compatible) `Store` backend (durable, shared across a cluster). A single
+/// Valkey `Store` backend (durable, shared across a cluster). A single
 /// mutex-guarded synchronous connection with one-shot reconnect - governance is off the request hot
 /// path, so serializing access is fine.
-pub struct RedisStore {
+pub struct ValkeyStore {
     client: redis::Client,
     /// The live connection, lazily (re)established. `None` after a detected drop.
     conn: Mutex<Option<Connection>>,
@@ -284,8 +284,8 @@ pub struct RedisStore {
     secret: Option<String>,
 }
 
-impl RedisStore {
-    /// Connect to Redis with the given URL (e.g. `redis://:pass@host:6379/0`, or
+impl ValkeyStore {
+    /// Connect to Valkey with the given URL (e.g. `redis://:pass@host:6379/0`, or
     /// `rediss://:pass@host:6380/0` for TLS via rustls + OS-native roots), using the
     /// [`DEFAULT_CONNECT_TIMEOUT`]. See [`Self::connect_with_timeout`] for a caller-supplied
     /// timeout.
@@ -294,19 +294,19 @@ impl RedisStore {
     }
 
     /// Like [`Self::connect`], but with an explicit connect timeout. Unlike postgres's libpq, the
-    /// `redis` crate gives no DSN-level timeout escape hatch, so a blackholed/firewalled host would
-    /// otherwise hang `get_connection()` indefinitely and wedge engine boot; bounding the initial
-    /// TCP connect here fails fast instead.
+    /// upstream driver crate gives no DSN-level timeout escape hatch, so a blackholed/firewalled
+    /// host would otherwise hang `get_connection()` indefinitely and wedge engine boot; bounding
+    /// the initial TCP connect here fails fast instead.
     pub fn connect_with_timeout(url: &str, timeout: Duration) -> StoreResult<Self> {
         let secret = url_password(url);
         if url.starts_with("rediss://") {
             let _ = rustls::crypto::ring::default_provider().install_default();
         }
         let client = redis::Client::open(url)
-            .map_err(|e| StoreError(scrub(format!("redis connect: {e}"), secret.as_deref())))?;
+            .map_err(|e| StoreError(scrub(format!("valkey connect: {e}"), secret.as_deref())))?;
         let conn = client
             .get_connection_with_timeout(timeout)
-            .map_err(|e| StoreError(scrub(format!("redis connect: {e}"), secret.as_deref())))?;
+            .map_err(|e| StoreError(scrub(format!("valkey connect: {e}"), secret.as_deref())))?;
         let store = Self {
             client,
             conn: Mutex::new(Some(conn)),
@@ -318,7 +318,7 @@ impl RedisStore {
     }
 
     /// STARTUP ASSERTION, non-negotiable: `maxmemory-policy` must be `noeviction`. Under any eviction
-    /// policy, Redis/Valkey can silently evict a denylist entry (un-revoking a compromised key) or a
+    /// policy, Valkey can silently evict a denylist entry (un-revoking a compromised key) or a
     /// metering row (destroying billing evidence) under memory pressure, with zero error anywhere in
     /// the request path — the loss is invisible until someone goes looking for data that should be
     /// there. Refuse to start rather than risk it. If `CONFIG GET` itself is disabled by an ACL
@@ -338,7 +338,7 @@ impl RedisStore {
         match policy {
             Some("noeviction") => Ok(()),
             Some(other) => Err(StoreError(format!(
-                "redis/valkey maxmemory-policy is '{other}', not 'noeviction': an eviction policy \
+                "valkey maxmemory-policy is '{other}', not 'noeviction': an eviction policy \
                  can silently drop a denylist entry (un-revoking a key) or a metering row \
                  (destroying billing evidence) under memory pressure with no error anywhere. \
                  Refusing to start. Run `CONFIG SET maxmemory-policy noeviction` (and persist it in \
@@ -346,7 +346,7 @@ impl RedisStore {
                  pointing busbar at this instance."
             ))),
             None => Err(StoreError(
-                "redis/valkey CONFIG GET maxmemory-policy returned no value — either this server \
+                "valkey CONFIG GET maxmemory-policy returned no value — either this server \
                  restricts CONFIG GET via ACL, or something unexpected happened. Refusing to start: \
                  cannot verify the noeviction invariant governance data durability depends on."
                     .to_string(),
@@ -444,7 +444,7 @@ impl RedisStore {
     }
 
     fn err(&self, e: redis::RedisError, ctx: &str) -> StoreError {
-        StoreError(scrub(format!("redis {ctx}: {e}"), self.secret.as_deref()))
+        StoreError(scrub(format!("valkey {ctx}: {e}"), self.secret.as_deref()))
     }
 
     /// Allocate the next revision — a plain `INCR`. Called once per key/credential mutation, inside
@@ -475,7 +475,7 @@ fn parse_slot_pointer(s: &str) -> Option<(String, String, u8)> {
     Some((key_id.to_string(), kind.to_string(), slot.parse().ok()?))
 }
 
-impl Store for RedisStore {
+impl Store for ValkeyStore {
     fn put_key(&self, key: &VirtualKey) -> StoreResult<()> {
         let mut key = key.clone();
         self.with_conn(|c| {

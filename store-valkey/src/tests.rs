@@ -51,7 +51,7 @@ fn password_scrub_and_extraction() {
 }
 
 #[test]
-fn rediss_url_is_accepted() {
+fn tls_url_scheme_is_accepted() {
     assert!(redis::Client::open("rediss://:pw@localhost:6380/0").is_ok());
 }
 
@@ -64,32 +64,32 @@ fn glob_escaping_covers_every_metacharacter() {
     assert_eq!(escape_glob("plain-id-123"), "plain-id-123");
 }
 
-/// End-to-end against a REAL Redis/Valkey, gated on `REDIS_URL` (a docker service in CI). Skips
+/// End-to-end against a REAL Valkey, gated on `VALKEY_URL` (a docker service in CI). Skips
 /// cleanly when unset LOCALLY; under `CI` a missing URL is a HARD FAILURE, never a silent skip.
-fn live_store() -> Option<RedisStore> {
-    let url = match std::env::var("REDIS_URL") {
+fn live_store() -> Option<ValkeyStore> {
+    let url = match std::env::var("VALKEY_URL") {
         Ok(url) => url,
         Err(_) if std::env::var_os("CI").is_some() => {
             panic!(
-                "REDIS_URL is unset under CI: the Redis/Valkey service container must provision \
+                "VALKEY_URL is unset under CI: the Valkey service container must provision \
                  it. Refusing to silently skip the only live-DB coverage in CI."
             );
         }
         Err(_) => {
             eprintln!(
-                "skip: set REDIS_URL to run the store-valkey tests (e.g. redis://127.0.0.1:6380/0)"
+                "skip: set VALKEY_URL to run the store-valkey tests (e.g. redis://127.0.0.1:6380/0)"
             );
             return None;
         }
     };
     // Deliberately NO namespace wipe here: `cargo test` runs tests in parallel by default, and
-    // every test in this file shares ONE Redis/Valkey instance — a per-test wipe would race every
+    // every test in this file shares ONE Valkey instance — a per-test wipe would race every
     // OTHER concurrently-running test's writes (this was tried and produced exactly that failure
     // mode: "unknown id" errors from a test's own key vanishing mid-flight under a sibling test's
     // wipe). Isolation instead comes from every test using its own distinct key id namespace
     // (`vk_<test-specific-name>`) — collisions across tests are a review-time discipline, not a
     // runtime guard, same as the crate's pre-existing test suite already relied on.
-    Some(RedisStore::connect(&url).expect("connect"))
+    Some(ValkeyStore::connect(&url).expect("connect"))
 }
 
 fn vk(id: &str) -> VirtualKey {
@@ -608,7 +608,7 @@ fn put_key_with_credential_writes_both_or_neither() {
 /// `with_conn` (used by `put_credential`) is documented "Safe only for READ / idempotent ops," but
 /// automatically reconnects-and-retries on any connection-level error (`is_timeout()` /
 /// `is_io_error()` / `is_connection_dropped()`) by re-running the ENTIRE transaction closure. If a
-/// connection blip drops the reply AFTER Redis has already committed the EXEC server-side, that
+/// connection blip drops the reply AFTER Valkey has already committed the EXEC server-side, that
 /// retry replays `put_credential` with the SAME `CredentialSecret` against a slot that now already
 /// holds it — exactly the scenario this test simulates directly (without needing to sever a real
 /// TCP connection): calling `put_credential` twice in a row with the identical secret must be a
@@ -690,7 +690,7 @@ fn delete_key_fails_loud_on_a_corrupt_credential_row_instead_of_orphaning_pointe
 
     let result = store.delete_key(&key_id);
     // Clean up the corrupted row ourselves (bypassing the trait, same as we corrupted it): this
-    // suite shares ONE long-lived Redis instance with no per-test wipe (see `live_store()`'s doc),
+    // suite shares ONE long-lived Valkey instance with no per-test wipe (see `live_store()`'s doc),
     // and `delete_key` correctly refusing to touch the corrupt row means it is still sitting there
     // for every other concurrently- or later-running test that scans all credentials (e.g.
     // `list_credentials_since`) to trip over — a real, malformed row is exactly what THIS test
@@ -778,7 +778,7 @@ fn metering_row_identity_does_not_collide_across_a_delimiter_character() {
     // `metering_row`'s key is `key_id|model|provider` joined with a bare, unescaped `|`. A model
     // or provider name containing `|` (an operator-authored config value -- lane/model names are
     // NOT restricted to a fixed charset anywhere in this crate or its callers) lets two otherwise
-    // DISTINCT (key_id, model, provider) triples collide onto the same Redis row: here
+    // DISTINCT (key_id, model, provider) triples collide onto the same Valkey row: here
     // `("k", "a|b", "p")` and `("k", "a", "b|p")` both join to `"k|a|b|p"`. Two logically separate
     // metering rows would then merge their HINCRBY'd token/request counters into one -- a billing
     // correctness bug, not just a cosmetic key-name wart.
@@ -841,7 +841,7 @@ fn metering_row_identity_does_not_collide_across_a_delimiter_character() {
 /// conflict between "this test needs exclusive access to shared server state" and "the rest of the
 /// suite assumes the shared server is always in its normal (noeviction) posture," not a bug in the
 /// assertion itself (verified: run alone, or with `--test-threads=1`, it passes every time). Run
-/// explicitly and alone: `REDIS_URL=... cargo test -p busbar-store-redis -- --ignored
+/// explicitly and alone: `VALKEY_URL=... cargo test -p busbar-store-valkey -- --ignored
 /// connect_refuses_to_start_under_an_eviction_policy`.
 #[test]
 #[ignore]
@@ -849,7 +849,7 @@ fn connect_refuses_to_start_under_an_eviction_policy() {
     let Some(_baseline) = live_store() else {
         return;
     };
-    let url = std::env::var("REDIS_URL").unwrap();
+    let url = std::env::var("VALKEY_URL").unwrap();
     let mut conn = redis::Client::open(url.as_str())
         .unwrap()
         .get_connection()
@@ -861,7 +861,7 @@ fn connect_refuses_to_start_under_an_eviction_policy() {
         .query(&mut conn)
         .unwrap();
 
-    let result = RedisStore::connect(&url);
+    let result = ValkeyStore::connect(&url);
 
     // ALWAYS restore, regardless of the assertion below, so a failure doesn't poison later tests.
     let _: () = redis::cmd("CONFIG")
@@ -880,7 +880,7 @@ fn connect_refuses_to_start_under_an_eviction_policy() {
 
 // ── migrate() / with_conn retry — mutation-testing coverage gaps (round: cargo-mutants) ───────
 //
-// `cargo-mutants` against `store-redis/src/lib.rs` found four real coverage gaps (no production
+// `cargo-mutants` against `store-valkey/src/lib.rs` found four real coverage gaps (no production
 // bug — the existing logic is correct, but nothing in the suite would have caught it breaking):
 //   - `migrate()`'s `version >= SCHEMA_VERSION` early-return guard (mutating `>=` to `<` survived
 //     every existing test) — nothing exercised a SECOND `connect()` against an
@@ -892,7 +892,7 @@ fn connect_refuses_to_start_under_an_eviction_policy() {
 //     genuine connection-level error (must retry and transparently recover).
 
 /// Kills the `version >= SCHEMA_VERSION` -> `version < SCHEMA_VERSION` mutant: a second
-/// `connect()` (fresh `RedisStore`, fresh internal `migrate()` call) against a namespace already
+/// `connect()` (fresh `ValkeyStore`, fresh internal `migrate()` call) against a namespace already
 /// at the current schema version must be a pure no-op, not a full `busbar:*` wipe.
 #[test]
 fn reconnecting_to_an_already_migrated_namespace_does_not_wipe_existing_data() {
@@ -904,8 +904,8 @@ fn reconnecting_to_an_already_migrated_namespace_does_not_wipe_existing_data() {
     let id = uid("vk_migrate_reconnect");
     store1.put_key(&vk(&id)).unwrap();
 
-    let url = std::env::var("REDIS_URL").unwrap();
-    let store2 = RedisStore::connect(&url).expect("a second connect() must succeed");
+    let url = std::env::var("VALKEY_URL").unwrap();
+    let store2 = ValkeyStore::connect(&url).expect("a second connect() must succeed");
     assert!(
         store2.get_key(&id).unwrap().is_some(),
         "a second connect()/migrate() against an already-migrated namespace must not wipe \
@@ -933,7 +933,7 @@ fn with_conn_does_not_retry_a_non_connection_error() {
         .with_conn(|c| redis::cmd("LPUSH").arg(&k).arg("x").query::<i64>(c))
         .expect_err("LPUSH against a string-valued key must fail with WRONGTYPE");
     assert!(
-        err.0.contains("redis command:"),
+        err.0.contains("valkey command:"),
         "a non-connection (WRONGTYPE) error must surface via the 'command' context, never \
          trigger the reconnect-and-retry path meant only for connection-level errors: {}",
         err.0
@@ -948,7 +948,7 @@ fn with_conn_does_not_retry_a_non_connection_error() {
 #[test]
 fn with_conn_transparently_reconnects_after_the_connection_is_dropped() {
     let Some(store) = live_store() else { return };
-    let url = std::env::var("REDIS_URL").unwrap();
+    let url = std::env::var("VALKEY_URL").unwrap();
 
     let my_id: i64 = store
         .with_conn(|c| redis::cmd("CLIENT").arg("ID").query(c))
@@ -1048,8 +1048,8 @@ fn migrate_v5_to_v6_wipes_a_namespace_with_refund_shaped_data() {
         .with_conn(|c| c.set::<_, _, ()>("busbar:schema", 5i64))
         .unwrap();
 
-    let url = std::env::var("REDIS_URL").unwrap();
-    let store2 = RedisStore::connect(&url).expect("connect() must succeed and run migrate()");
+    let url = std::env::var("VALKEY_URL").unwrap();
+    let store2 = ValkeyStore::connect(&url).expect("connect() must succeed and run migrate()");
 
     assert_eq!(
         store2.get_usage(bucket, 1_700_000_000).unwrap(),
@@ -1064,7 +1064,7 @@ fn migrate_v5_to_v6_wipes_a_namespace_with_refund_shaped_data() {
     );
 }
 
-/// A destructive full-namespace wipe of a REAL Redis/Valkey, gated on the SAME `REDIS_URL` as
+/// A destructive full-namespace wipe of a REAL Valkey, gated on the SAME `VALKEY_URL` as
 /// every other live test above. `#[ignore]`d so a bare `cargo test` never touches a shared dev
 /// instance by accident.
 #[test]

@@ -82,6 +82,8 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.11.0",
+ "smallvec",
+ "zeroize",
 ]
 
 [[package]]
@@ -133,7 +135,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "busbar-store-redis"
+name = "busbar-store-valkey"
 version = "1.0.0"
 dependencies = [
  "busbar-api",
@@ -143,14 +145,14 @@ dependencies = [
 ]
 
 [[package]]
-name = "busbar-store-redis-plugin"
+name = "busbar-store-valkey-plugin"
 version = "1.0.0"
 dependencies = [
  "base64",
  "busbar-api",
  "busbar-plugin-loader",
  "busbar-plugin-sdk",
- "busbar-store-redis",
+ "busbar-store-valkey",
  "redis",
  "reqwest",
  "serde_json",

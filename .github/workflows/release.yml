@@ -1,11 +1,11 @@
-# Release: on a version tag (e.g. v1.0.0), build the store-redis plugin cdylib for all 5
+# Release: on a version tag (e.g. v1.0.0), build the store-valkey plugin cdylib for all 5
 # supported targets, pack + sign each into a loadable busbar plugin tarball, and publish them to
 # THIS repo's own GitHub Release.
 #
 # This mirrors busbarAI/.github/workflows/release.yml's `store-plugins` job — same 5-target
 # matrix, same busbar-plugin-pack pack/sign step (built from a sibling busbar checkout), same
 # BUSBAR_SIGN_KEY-or-`--allow-unsigned` fallback, same `gh release upload` + build-provenance
-# attestation — just scoped to this one plugin instead of building sqlite/postgres/redis together
+# attestation — just scoped to this one plugin instead of building sqlite/postgres/valkey together
 # in one monorepo job.
 #
 # Supersedes the prior stopgap release.yml, which only built raw UNSIGNED cdylibs for 3 targets
@@ -43,7 +43,7 @@ jobs:
           set +e
           out="$(gh release create "${GITHUB_REF_NAME}" \
             --repo "${GITHUB_REPOSITORY}" \
-            --title "busbar-store-redis ${GITHUB_REF_NAME}" \
+            --title "busbar-store-valkey ${GITHUB_REF_NAME}" \
             --verify-tag --generate-notes 2>&1)"
           status=$?
           echo "$out"
@@ -95,14 +95,14 @@ jobs:
             libext: dll
             libprefix: ""
     steps:
-      - name: Checkout store-redis
+      - name: Checkout store-valkey
         uses: actions/checkout@v7
         with:
-          path: store-redis
+          path: store-valkey
 
       - name: Resolve busbar ref from .busbar-ref
         id: ref
-        run: echo "sha=$(cut -d' ' -f1 store-redis/.busbar-ref)" >> "$GITHUB_OUTPUT"
+        run: echo "sha=$(cut -d' ' -f1 store-valkey/.busbar-ref)" >> "$GITHUB_OUTPUT"
         shell: bash
 
       - name: Checkout busbar (sibling path dependency)
@@ -117,8 +117,8 @@ jobs:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
 
-      - name: Build the store-redis plugin cdylib
-        working-directory: store-redis
+      - name: Build the store-valkey plugin cdylib
+        working-directory: store-valkey
         run: cargo build --release --target ${{ matrix.target }}
         shell: bash
 
@@ -142,14 +142,14 @@ jobs:
             echo "::warning::BUSBAR_SIGN_KEY secret is not provisioned — packaging an UNSIGNED plugin tarball (loadable only under plugins.trust.allow_unsigned). See busbarAI's release.yml TODO(release-keys) seam."
             unsigned_flag="--allow-unsigned"
           fi
-          lib="store-redis/target/${target}/release/${{ matrix.libprefix }}busbar_store_redis_plugin.${{ matrix.libext }}"
+          lib="store-valkey/target/${target}/release/${{ matrix.libprefix }}busbar_store_valkey_plugin.${{ matrix.libext }}"
           "$pack" pack \
             --lib "$lib" \
-            --name "busbar-store-redis-plugin" --alias "redis" --kind store \
+            --name "busbar-store-valkey-plugin" --alias "valkey" --kind store \
             --version "$ver" --publisher busbar \
-            --description "The Redis store as a droppable busbar plugin — a cdylib exporting the store C ABI. Drop it in the plugins folder and set store.module: redis. One Redis behind a fleet of busbar nodes means shared virtual keys, budgets, usage, and audit across the cluster." \
+            --description "The Valkey store as a droppable busbar plugin — a cdylib exporting the store C ABI. Drop it in the plugins folder and set store.module: valkey. One Valkey behind a fleet of busbar nodes means shared virtual keys, budgets, usage, and audit across the cluster." \
             --license Apache-2.0 \
-            --out "${outdir}/busbar-store-redis-${ver}-${target}.tar.gz" \
+            --out "${outdir}/busbar-store-valkey-${ver}-${target}.tar.gz" \
             $unsigned_flag
           ls -l "$outdir"
         shell: bash

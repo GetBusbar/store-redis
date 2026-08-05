@@ -1,30 +1,30 @@
 # SPDX-License-Identifier: Apache-2.0
 [package]
-name = "busbar-store-redis-plugin"
+name = "busbar-store-valkey-plugin"
 version = "1.0.0"
 publish = false            # first-party store plugin cdylib, shipped as a packed/signed tarball, not to crates.io
 edition = "2021"
 rust-version = "1.97"
-description = "The Redis store as a droppable busbar plugin — a cdylib exporting the store C ABI. Drop it in the plugins folder and set store.module: redis. One Redis behind a fleet of busbar nodes means shared virtual keys, budgets, usage, and audit across the cluster."
+description = "The Valkey store as a droppable busbar plugin — a cdylib exporting the store C ABI. Drop it in the plugins folder and set store.module: valkey. One Valkey behind a fleet of busbar nodes means shared virtual keys, budgets, usage, and audit across the cluster."
 license = "Apache-2.0"
 
 [lib]
 crate-type = ["cdylib"]
 
 [dependencies]
-# busbar-store-redis is now a SAME-REPO sibling crate (this plugin brings 100% of what it needs — the
+# busbar-store-valkey is now a SAME-REPO sibling crate (this plugin brings 100% of what it needs — the
 # real logic lives here, not in busbarAI). Only busbar-api/busbar-plugin-sdk still reach into busbarAI
 # — INTERIM local path dependencies into a sibling checkout, since busbarAI isn't public yet; once it
 # ships publicly these become git (pinned rev/tag) or crates.io dependencies instead.
 busbar-api = { path = "../../busbarAI/crates/api" }
 busbar-plugin-sdk = { path = "../../busbarAI/crates/plugin-sdk" }
-busbar-store-redis = { path = "../store-redis" }
+busbar-store-valkey = { path = "../store-valkey" }
 serde_json = "1"
 
 [dev-dependencies]
 # INTERIM local path deps into busbarAI, same rationale as above — dev-only (the end-to-end test loads
-# the built cdylib over the real loader ABI seam, and separately connects to the live Redis
-# independently via the plain busbar-store-redis lib crate), never shipped in the plugin artifact
+# the built cdylib over the real loader ABI seam, and separately connects to the live Valkey
+# independently via the plain busbar-store-valkey lib crate), never shipped in the plugin artifact
 # itself.
 busbar-plugin-loader = { path = "../../busbarAI/crates/plugin-loader" }
 # Dev-only: the real-admin-API e2e test builds+drives an actual `busbar` process over HTTP (install a
@@ -33,9 +33,10 @@ busbar-plugin-loader = { path = "../../busbarAI/crates/plugin-loader" }
 # Same major version busbarAI's own `busbar` crate pins (crates/busbar/Cargo.toml), rustls-tls only —
 # no default features, mirroring that crate's own trimmed feature set.
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
-# Dev-only: the real-admin-API e2e test's independent verification step reads the raw Redis row
-# bytes directly (bypassing busbar-store-redis's own Store impl too, not just the plugin/ABI) —
-# same version pin as busbar-store-redis itself.
+# Dev-only: the real-admin-API e2e test's independent verification step reads the raw Valkey row
+# bytes directly (bypassing busbar-store-valkey's own Store impl too, not just the plugin/ABI) —
+# same version pin as busbar-store-valkey itself. (Upstream crates.io package, still published
+# under its pre-fork name — not ours to rename; see busbar-store-valkey's own Cargo.toml.)
 redis = { version = "1", default-features = false, features = ["tls-rustls"] }
 # Dev-only: base64-encodes the packed tarball into POST /api/v1/admin/plugins's JSON body — already
 # in the dependency graph transitively (reqwest), pinned here explicitly since the test uses it

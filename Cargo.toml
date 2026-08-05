@@ -1,13 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 #
-# This repo brings 100% of what it needs: the real Redis store logic (store-redis) and the thin
-# dlopen ABI adapter that packages it as a busbar plugin (store-redis-plugin) both live here, as a
+# This repo brings 100% of what it needs: the real Valkey store logic (store-valkey) and the thin
+# dlopen ABI adapter that packages it as a busbar plugin (store-valkey-plugin) both live here, as a
 # same-repo Cargo workspace — not split across this repo and busbarAI. Only busbar-api/busbar-plugin-sdk
 # (and, for the adapter's dev-dependencies, busbar-plugin-loader) still reach into a sibling busbarAI
 # checkout, since those are core-engine contracts every plugin depends on the same way.
 [workspace]
 resolver = "2"
 members = [
-    "store-redis",
-    "store-redis-plugin",
+    "store-valkey",
+    "store-valkey-plugin",
 ]
