@@ -429,12 +429,24 @@ fn admin_api_installs_the_valkey_plugin_and_writes_land_in_real_valkey() {
     // No `store:` block at first boot — proves the plugin isn't already active some other way;
     // the whole point of this test is the RUNTIME install path. `admin_auth` grants Full scope
     // via a static bearer token (mirrors CI's INSTALL-AND-SERVE step exactly).
+    //
+    // 1.5.3 GRAMMAR: the operator token provider is DEFINED ONCE under the top-level
+    // `identity-providers:` named map and REFERENCED BY BARE NAME from `auth.admin_auth:`. The old
+    // INLINE form (`admin_auth: [ { admin-tokens: { token: … } } ]`) is a retired 1.x marker as of
+    // 1.5.3: `config::migrate::detect_legacy_markers` flags any map-shaped `auth.chain:`/
+    // `auth.admin_auth:` entry, and a non-empty marker list is a FAIL-CLOSED boot refusal in
+    // `main.rs` (`legacy_config_error`) — not a warning. Writing the inline form here would kill
+    // BOTH boots below at startup with a config error, long before the admin listener ever binds.
+    // Shape confirmed against core's `IdentityProviderCfg` / `resolve_auth` in
+    // `crates/busbar/src/config/mod.rs`, and byte-for-byte against `busbar --migrate-config`'s own
+    // output for the previous inline form.
     std::fs::write(
         &config,
         format!(
             "listen: \"127.0.0.1:{port}\"\n\
              admin_listen: \"127.0.0.1:{admin_port}\"\n\
-             auth:\n  chain: [keys]\n  signing_key: {{ env: BUSBAR_SIGNING_KEY }}\n  admin_auth:\n    - admin-tokens: {{ token: {{ env: E2E_ADMIN_TOKEN }} }}\n\
+             identity-providers:\n  admin-tokens:\n    module: admin-tokens\n    token: {{ env: E2E_ADMIN_TOKEN }}\n\
+             auth:\n  chain: [keys]\n  signing_key: {{ env: BUSBAR_SIGNING_KEY }}\n  admin_auth: [admin-tokens]\n\
              plugins:\n  enabled: true\n  dir: {}\n  trust:\n    allow_unsigned: true\n\
              providers:\n  mock:\n    api_key: {{ env: MOCK_KEY }}\n\
              models:\n  test-model:\n    provider: mock\n",
