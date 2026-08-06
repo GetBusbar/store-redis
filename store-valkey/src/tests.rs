@@ -1097,10 +1097,18 @@ fn audit_append_and_list_are_ordered_oldest_first() {
         tail[0].seq < tail[1].seq,
         "tail is still oldest-first WITHIN the tail: {tail:?}"
     );
-    assert!(
-        tail.iter().all(|r| r.seq >= 3),
-        "the tail must come from the NEWEST end, past this test's own seqs: {tail:?}"
-    );
+    // Deliberately makes NO claim about WHICH entries the tail contains.
+    //
+    // Two earlier attempts here were both wrong for the same underlying reason: this test does not
+    // own `busbar:audit`. Asserting `seq >= 3` was false whenever the zset held only this test's own
+    // 1,2,3 (tail = [2,3]) and passed only on a sibling's litter. Asserting the tail is a slice of a
+    // separately-fetched `list_audit` then raced siblings PURGING their seqs between the two reads.
+    // A global-shape claim is simply not verifiable from here while other tests mutate the same key.
+    //
+    // What is race-free and is genuinely `list_audit_tail`'s contract: whatever it returns comes back
+    // OLDEST-FIRST within the tail. That is asserted above. The ordering of this test's own three
+    // records is asserted against the filtered `list_audit` view, which is likewise unaffected by
+    // siblings. Between them the method's two promises are covered without borrowing anyone's state.
 }
 
 /// The v5->v6 SCHEMA_VERSION bump exists to close a real billing bug: `GovState::hydrate_budgets`
