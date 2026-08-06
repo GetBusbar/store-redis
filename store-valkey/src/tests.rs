@@ -422,7 +422,8 @@ fn put_credential_rejects_a_live_slot_but_allows_reclaiming_a_revoked_one() {
     store.put_key_with_credential(&key, &c0).unwrap();
 
     // Minting into the SAME live slot must fail loudly, not silently overwrite.
-    let c0b = cred(&vk_id, &uid("AKIA_0B"), 0);
+    let pub_0b = uid("AKIA_0B");
+    let c0b = cred(&vk_id, &pub_0b, 0);
     assert!(
         store.put_credential(&c0b).is_err(),
         "minting into a slot holding a LIVE credential must be rejected"
@@ -434,7 +435,7 @@ fn put_credential_rejects_a_live_slot_but_allows_reclaiming_a_revoked_one() {
         store.put_credential(&c0b).is_ok(),
         "a revoked slot must be reclaimable"
     );
-    let live = store.lookup_credential_secret("sigv4", "AKIA_0B").unwrap();
+    let live = store.lookup_credential_secret("sigv4", &pub_0b).unwrap();
     assert!(live.is_some());
 }
 
