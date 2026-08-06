@@ -682,19 +682,37 @@ fn delete_key_fails_loud_on_a_corrupt_credential_row_instead_of_orphaning_pointe
     let c = cred(&key_id, &public_id, 0);
     store.put_key_with_credential(&key, &c).unwrap();
 
-    // Corrupt the credential row directly, bypassing the trait — simulates operator-side data
-    // corruption / a schema-drift bug, not something reachable through this crate's own API.
+    // FIRST take this credential out of the `busbar:creds:byrev` index, THEN corrupt its row.
+    // Order matters, and the DEL below does not make this redundant.
+    //
+    // `list_credentials_since` reads that index and NOTHING else, and it is a GLOBAL scan of every
+    // credential ever written to this shared instance. The DEL at the end of this test removes the
+    // poison row, but only AFTER `delete_key` has returned — so for the whole duration of that call
+    // the row is live, indexed, and visible to any test scanning concurrently. This suite runs its
+    // tests in parallel against ONE long-lived Valkey (see `live_store()`), so that window is not
+    // theoretical: `list_credentials_since_carries_the_secret_for_hydration` loses the race and
+    // fails with `credential decode failed: expected ident at line 1 column 2` — the literal string
+    // `"not json"` written below, surfacing in a completely unrelated test.
+    //
+    // Dropping the index entry first costs this test nothing, because `delete_key` never consults
+    // that index: it reaches the credential row through the key's own credential-id pointers, which
+    // is exactly the path under test. So the corrupt row stays fully reachable by the code this
+    // test exercises, and unreachable by the global scan it has no business breaking.
     store
-        .with_conn(|conn| conn.set::<_, _, ()>(cred_row_key(&key_id, "sigv4", 0), "not json"))
+        .with_conn(|conn| {
+            conn.zrem::<_, _, ()>(CREDS_BYREV, format!("{key_id}:sigv4:0"))?;
+            conn.set::<_, _, ()>(cred_row_key(&key_id, "sigv4", 0), "not json")
+        })
         .unwrap();
 
     let result = store.delete_key(&key_id);
     // Clean up the corrupted row ourselves (bypassing the trait, same as we corrupted it): this
     // suite shares ONE long-lived Valkey instance with no per-test wipe (see `live_store()`'s doc),
     // and `delete_key` correctly refusing to touch the corrupt row means it is still sitting there
-    // for every other concurrently- or later-running test that scans all credentials (e.g.
-    // `list_credentials_since`) to trip over — a real, malformed row is exactly what THIS test
-    // means to exercise, not something later tests should have to survive.
+    // for every later-running test to trip over — a real, malformed row is exactly what THIS test
+    // means to exercise, not something later tests should have to survive. (Tests running
+    // CONCURRENTLY with this one are covered by the de-indexing above, not by this line, which
+    // cannot run until `delete_key` has already returned.)
     store
         .with_conn(|conn| conn.del::<_, ()>(cred_row_key(&key_id, "sigv4", 0)))
         .unwrap();
