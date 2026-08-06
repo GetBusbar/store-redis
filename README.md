@@ -69,10 +69,9 @@ and is loaded in-process by busbar over the signed store ABI —
 
 This crate (`busbar-store-valkey-plugin`) is intentionally a thin
 adapter: all the Valkey schema/serialization/retry/TLS logic lives in the
-`busbar-store-valkey` library crate it wraps (from the
-[busbarAI](https://github.com/GetBusbar/busbar) monorepo — see
-[Dependencies](#dependencies)); here we only translate the engine's JSON
-`open` config into a live `ValkeyStore`.
+`busbar-store-valkey` library crate it wraps, in the `store-valkey/` directory of
+this repository; here we only translate the engine's JSON `open` config into a
+live `ValkeyStore`.
 
 ## Build
 
@@ -90,10 +89,10 @@ cargo fmt --all -- --check
 
 ## Dependencies
 
-This crate depends on `busbar-api`, `busbar-plugin-sdk`, and
-`busbar-store-valkey` (the KV-modeling logic crate it thinly adapts) —
-and, as a dev-dependency for the end-to-end test, `busbar-plugin-loader`
-— from the [busbarAI](https://github.com/GetBusbar/busbar) monorepo.
+`busbar-store-valkey`, the KV-modeling logic crate this plugin thinly adapts,
+lives in this repository. `busbar-api` and `busbar-plugin-sdk`, and the
+`busbar-plugin-loader` dev-dependency the end-to-end test uses, come from the
+[busbarAI](https://github.com/GetBusbar/busbar) monorepo.
 Because busbarAI is not yet public, `Cargo.toml` points at these as
 **local path dependencies** (`../busbarAI/crates/...`), which means this
 repo expects to be checked out as a sibling of `busbarAI`:

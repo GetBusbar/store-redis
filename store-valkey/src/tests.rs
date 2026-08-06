@@ -413,12 +413,16 @@ fn scrub_key_nulls_name_and_labels_after_tombstone() {
 #[test]
 fn put_credential_rejects_a_live_slot_but_allows_reclaiming_a_revoked_one() {
     let Some(store) = live_store() else { return };
-    let key = vk("vk_slot");
-    let c0 = cred("vk_slot", "AKIA_0", 0);
+    // Unique per run, like every other fixture here: literal ids collide when this binary's
+    // tests run concurrently against one shared Valkey, and the loser fails on a row a
+    // different test wrote.
+    let vk_id = uid("vk_slot");
+    let key = vk(&vk_id);
+    let c0 = cred(&vk_id, &uid("AKIA_0"), 0);
     store.put_key_with_credential(&key, &c0).unwrap();
 
     // Minting into the SAME live slot must fail loudly, not silently overwrite.
-    let c0b = cred("vk_slot", "AKIA_0B", 0);
+    let c0b = cred(&vk_id, &uid("AKIA_0B"), 0);
     assert!(
         store.put_credential(&c0b).is_err(),
         "minting into a slot holding a LIVE credential must be rejected"

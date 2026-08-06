@@ -50,8 +50,8 @@ JSON `open` config into a `ValkeyStore` and hands the trait object to
 [`busbar-plugin-sdk`](https://github.com/GetBusbar/busbarAI/tree/main/crates/plugin-sdk),
 which emits the C ABI symbols the loader resolves. All the Valkey schema,
 serialization, and retry/TLS logic lives in the `busbar-store-valkey` library
-crate this plugin wraps, in the `busbarAI` monorepo — most substantive changes
-belong there, not here.
+crate this plugin wraps, in the `store-valkey/` directory of THIS repository, so
+most substantive changes belong here.
 
 ## Commit & PR conventions
 

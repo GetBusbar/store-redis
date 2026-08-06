@@ -1186,9 +1186,17 @@ impl Store for ValkeyStore {
                     pipe.atomic();
                     return pipe.query(c);
                 };
+                // A pointer that exists but does not parse is CORRUPTION, not an unknown id.
+                // Returning Ok here would report a revocation that never happened: the row keeps
+                // its secret, `revoked_at` stays unset, and the credential goes on authenticating
+                // while the audit trail says it was revoked. `delete_key` already fails loud on
+                // the sibling case (see `delete_key_fails_loud_on_a_corrupt_credential_row`).
                 let Some((key_id, kind, slot)) = parse_slot_pointer(&ptr) else {
-                    pipe.atomic();
-                    return pipe.query(c);
+                    return Err(redis::RedisError::from((
+                        redis::ErrorKind::Client,
+                        "corrupt credential pointer",
+                        format!("busbar:cred:id:{id} does not parse as <key_id>:<kind>:<slot>"),
+                    )));
                 };
                 let row_key = cred_row_key(&key_id, &kind, slot);
                 let raw: Option<String> = c.get(&row_key)?;
