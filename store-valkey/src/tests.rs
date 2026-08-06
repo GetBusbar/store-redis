@@ -200,6 +200,12 @@ fn list_keys_since_only_returns_keys_past_the_watermark() {
 #[test]
 fn list_keys_is_unfiltered_including_tombstones() {
     let Some(store) = live_store() else { return };
+    // This suite runs against a SHARED, PERSISTENT Valkey that is not flushed between runs, and
+    // this test uses a FIXED id. It used to be self-healing only because `put_key` resurrected
+    // whatever tombstone a prior run had left on that id; now that `put_key` refuses to clear a
+    // tombstone, the fixture has to be removed explicitly.
+    let _ = store.purge_key_for_test("vk_live");
+    let _ = store.purge_key_for_test("vk_dead");
     store.put_key(&vk("vk_live")).unwrap();
     store.put_key(&vk("vk_dead")).unwrap();
     store.delete_key("vk_dead").unwrap();
@@ -223,6 +229,11 @@ fn list_keys_is_unfiltered_including_tombstones() {
 #[test]
 fn delete_key_tombstones_not_removes() {
     let Some(store) = live_store() else { return };
+    // This suite runs against a SHARED, PERSISTENT Valkey that is not flushed between runs, and
+    // this test uses a FIXED id. It used to be self-healing only because `put_key` resurrected
+    // whatever tombstone a prior run had left on that id; now that `put_key` refuses to clear a
+    // tombstone, the fixture has to be removed explicitly.
+    let _ = store.purge_key_for_test("vk_del");
     store.put_key(&vk("vk_del")).unwrap();
     store.delete_key("vk_del").unwrap();
     let row = store
@@ -245,6 +256,11 @@ fn delete_key_unknown_id_errors() {
 #[test]
 fn delete_key_is_idempotent_once_tombstoned() {
     let Some(store) = live_store() else { return };
+    // This suite runs against a SHARED, PERSISTENT Valkey that is not flushed between runs, and
+    // this test uses a FIXED id. It used to be self-healing only because `put_key` resurrected
+    // whatever tombstone a prior run had left on that id; now that `put_key` refuses to clear a
+    // tombstone, the fixture has to be removed explicitly.
+    let _ = store.purge_key_for_test("vk_x");
     store.put_key(&vk("vk_x")).unwrap();
     store.delete_key("vk_x").unwrap();
     let rev_after_first = store.get_key("vk_x").unwrap().unwrap().revision;
@@ -331,6 +347,11 @@ fn delete_key_cleans_up_reverse_lookup_pointers() {
 #[test]
 fn delete_key_removes_usage_windows() {
     let Some(store) = live_store() else { return };
+    // This suite runs against a SHARED, PERSISTENT Valkey that is not flushed between runs, and
+    // this test uses a FIXED id. It used to be self-healing only because `put_key` resurrected
+    // whatever tombstone a prior run had left on that id; now that `put_key` refuses to clear a
+    // tombstone, the fixture has to be removed explicitly.
+    let _ = store.purge_key_for_test("vk_usage");
     store.put_key(&vk("vk_usage")).unwrap();
     store
         .add_usage(
@@ -394,6 +415,11 @@ fn scrub_key_requires_tombstone_first() {
 #[test]
 fn scrub_key_nulls_name_and_labels_after_tombstone() {
     let Some(store) = live_store() else { return };
+    // This suite runs against a SHARED, PERSISTENT Valkey that is not flushed between runs, and
+    // this test uses a FIXED id. It used to be self-healing only because `put_key` resurrected
+    // whatever tombstone a prior run had left on that id; now that `put_key` refuses to clear a
+    // tombstone, the fixture has to be removed explicitly.
+    let _ = store.purge_key_for_test("vk_scrub");
     let mut key = vk("vk_scrub");
     key.labels.insert("team".to_string(), "growth".to_string());
     store.put_key(&key).unwrap();
@@ -464,9 +490,18 @@ fn revoke_by_a_reclaimed_slots_old_id_must_not_touch_the_new_occupant() {
     c1.meta.id = uid("cred_new");
     store.put_credential(&c1).unwrap();
 
-    // A stale/duplicate revoke against the OLD id must be a no-op -- it must NOT reach into the
-    // slot (now occupied by c1) and revoke/secret-wipe the new, live credential.
-    store.revoke_credential(&c0.meta.id, "stale retry").unwrap();
+    // A stale/duplicate revoke against the OLD id must not reach into the slot (now occupied by c1)
+    // and revoke/secret-wipe the new, live credential. It now ERRORS rather than returning Ok: the
+    // old id's pointer went away when the slot was reclaimed, so it names no row, and the settled
+    // contract makes that an error precisely so an operator is never told a revocation happened
+    // when nothing was touched. Both halves matter, so both are asserted -- refused AND harmless.
+    let err = store
+        .revoke_credential(&c0.meta.id, "stale retry")
+        .expect_err("the old id names no credential once its slot was reclaimed");
+    assert!(
+        err.to_string().contains("unknown id"),
+        "the refusal must say why: {err}"
+    );
 
     let live = store
         .lookup_credential_secret("sigv4", &c1.meta.public_id)
@@ -538,11 +573,16 @@ fn revoke_credential_destroys_secret_and_is_idempotent() {
 }
 
 #[test]
-fn revoke_credential_unknown_id_is_idempotent_noop() {
+fn revoke_credential_unknown_id_errors() {
     let Some(store) = live_store() else { return };
+    // This used to assert Ok, reading the trait's "Idempotent" as covering an unknown id. It does
+    // not: idempotent covers revoking an ALREADY-REVOKED id. An id that names nothing is an error,
+    // because a silent no-op lets an operator responding to a leak believe the credential is dead
+    // while it is still live and still authenticating. Settled in the trait doc and asserted for
+    // every backend by the shared conformance suite.
     assert!(
-        store.revoke_credential("cred_never_existed", "n/a").is_ok(),
-        "revoking an unknown credential id must be a no-op, matching the trait's Idempotent doc"
+        store.revoke_credential("cred_never_existed", "n/a").is_err(),
+        "revoking an id that names no credential must error, distinct from re-revoking a revoked one"
     );
 }
 
@@ -1010,6 +1050,14 @@ fn denylist_add_and_list_round_trips() {
 #[test]
 fn audit_append_and_list_are_ordered_oldest_first() {
     let Some(store) = live_store() else { return };
+    // The audit zset is SHARED and persistent, and this test used to be the only writer of low
+    // seqs, so it could assume it owned the whole thing. It never really did: it only looked that
+    // way because `append_audit` OVERWROTE by score, so rerunning it replaced seqs 1..3 in place
+    // rather than adding to them. Now that a duplicate seq is compared instead of overwritten, the
+    // fixture is cleared first and the assertions filter to the seqs this test actually wrote.
+    for seq in 1..=3u64 {
+        let _ = store.purge_audit_seq_for_test(seq);
+    }
     for seq in 1..=3u64 {
         store
             .append_audit(&AuditRecord {
@@ -1024,15 +1072,41 @@ fn audit_append_and_list_are_ordered_oldest_first() {
             })
             .unwrap();
     }
-    let all = store.list_audit().unwrap();
+    let all: Vec<_> = store
+        .list_audit()
+        .unwrap()
+        .into_iter()
+        .filter(|r| (1..=3).contains(&r.seq))
+        .collect();
     assert_eq!(all.len(), 3);
     assert_eq!(all[0].seq, 1, "oldest first");
     assert_eq!(all[2].seq, 3);
 
+    // The tail is the highest seqs in the WHOLE shared zset, which this test does not own and
+    // cannot pin to 2 and 3 (it only used to look that way because `append_audit` overwrote by
+    // score, so nothing but this test's own low seqs ever accumulated). Assert the two properties
+    // that are actually `list_audit_tail`'s: it returns the newest entries, and it returns them
+    // oldest-first within the tail. Checked against `list_audit` so it stays true whoever else has
+    // written.
     let tail = store.list_audit_tail(2).unwrap();
     assert_eq!(tail.len(), 2);
-    assert_eq!(tail[0].seq, 2, "tail is still oldest-first WITHIN the tail");
-    assert_eq!(tail[1].seq, 3);
+    assert!(
+        tail[0].seq < tail[1].seq,
+        "tail is still oldest-first WITHIN the tail: {tail:?}"
+    );
+    let everything = store.list_audit().unwrap();
+    let newest_two: Vec<u64> = everything
+        .iter()
+        .rev()
+        .take(2)
+        .rev()
+        .map(|r| r.seq)
+        .collect();
+    assert_eq!(
+        tail.iter().map(|r| r.seq).collect::<Vec<_>>(),
+        newest_two,
+        "the tail must be the NEWEST entries"
+    );
 }
 
 /// The v5->v6 SCHEMA_VERSION bump exists to close a real billing bug: `GovState::hydrate_budgets`
@@ -1109,4 +1183,127 @@ fn wipes_the_entire_namespace_destructively() {
         })
         .unwrap();
     assert!(store.get_key("vk_wipe_me").unwrap().is_none());
+}
+
+/// The shared `Store` contract conformance suite (`busbar-plugin-testkit`) — the four behaviours the
+/// fleet used to settle differently per backend. Kept in the testkit rather than written out here so
+/// a future ruling reaches every backend at once instead of being hand-copied and drifting again.
+///
+/// Fixtures are namespaced per process AND per check, and cleaned first. Per-process because this
+/// runs against a SHARED live Valkey that is not flushed between tests; per-check because these run
+/// in parallel and the cleanup clears every id in the namespace it is given, so one shared namespace
+/// would have each check deleting the others' rows mid-run.
+mod conformance {
+    use super::{live_store, ValkeyStore};
+    use busbar_plugin_testkit::store_conformance as conf;
+
+    fn ns(check: &str) -> String {
+        format!("vk_c{}{}", std::process::id(), check)
+    }
+
+    /// Remove every row this suite is about to write, so a rerun (or a crashed prior run that left
+    /// state behind) starts from the same place as a first run.
+    fn reset(store: &ValkeyStore, ns: &str, seq: u64) {
+        for id in conf::key_ids(ns) {
+            let _ = store.purge_key_for_test(&id);
+        }
+        for id in conf::credential_ids(ns) {
+            let _ = store.purge_credential_for_test(&id);
+        }
+        if seq != 0 {
+            let _ = store.purge_audit_seq_for_test(seq);
+        }
+    }
+
+    fn setup(check: &str, seq: u64) -> Option<(ValkeyStore, String)> {
+        let store = live_store()?;
+        let ns = ns(check);
+        reset(&store, &ns, seq);
+        Some((store, ns))
+    }
+
+    #[test]
+    fn put_key_does_not_resurrect_a_tombstone() {
+        let Some((store, ns)) = setup("put", 0) else {
+            return;
+        };
+        conf::assert_put_key_does_not_resurrect_a_tombstone(&store, &ns);
+    }
+
+    #[test]
+    fn delete_key_unknown_id_is_an_error() {
+        let Some((store, ns)) = setup("del", 0) else {
+            return;
+        };
+        conf::assert_delete_key_unknown_id_is_an_error(&store, &ns);
+    }
+
+    #[test]
+    fn revoke_credential_unknown_id_is_an_error() {
+        let Some((store, ns)) = setup("rev", 0) else {
+            return;
+        };
+        conf::assert_revoke_credential_unknown_id_is_an_error(&store, &ns);
+    }
+
+    #[test]
+    fn append_audit_duplicate_seq_is_ok_when_identical_and_an_error_when_different() {
+        let seq = 910_000_000u64 + (std::process::id() as u64 % 1_000_000);
+        let Some((store, _ns)) = setup("aud", seq) else {
+            return;
+        };
+        conf::assert_append_audit_duplicate_seq(&store, seq);
+    }
+}
+
+/// One undecodable credential row must not break the hydration delta for EVERY key.
+///
+/// `list_credentials_since` is a global scan of every credential in the store, so propagating a
+/// decode failure meant a single corrupt row made the engine hydrate NO credentials at all — a
+/// store-wide authentication outage caused by one bad row. Skipping it degrades that to exactly one
+/// credential missing, and skipping is the fail-CLOSED direction: a row that cannot be decoded
+/// cannot authenticate anyone, so omitting it denies access rather than granting it.
+///
+/// Found because a sibling test plants a corrupt row on purpose and this suite shares one live
+/// instance, so the failure surfaced as an unrelated test flaking roughly half the time.
+#[test]
+fn one_corrupt_credential_row_does_not_break_the_whole_hydration_delta() {
+    let Some(store) = live_store() else { return };
+
+    // A healthy credential that MUST still come back.
+    let good_key = uid("vk_delta_good");
+    let good_pub = uid("AKIA_DELTA_GOOD");
+    let good = cred(&good_key, &good_pub, 0);
+    store
+        .put_key_with_credential(&vk(&good_key), &good)
+        .unwrap();
+
+    // A corrupt one, left INDEXED so the scan actually reaches it — that is the whole point.
+    let bad_key = uid("vk_delta_bad");
+    let bad_pub = uid("AKIA_DELTA_BAD");
+    store
+        .put_key_with_credential(&vk(&bad_key), &cred(&bad_key, &bad_pub, 0))
+        .unwrap();
+    store
+        .with_conn(|conn| conn.set::<_, _, ()>(cred_row_key(&bad_key, "sigv4", 0), "not json"))
+        .unwrap();
+
+    let delta = store
+        .list_credentials_since(0)
+        .expect("one undecodable row must not fail the entire delta");
+    assert!(
+        delta.iter().any(|c| c.meta.public_id == good_pub),
+        "the healthy credential must still hydrate"
+    );
+    assert!(
+        !delta.iter().any(|c| c.meta.public_id == bad_pub),
+        "the corrupt credential must be absent, not partially decoded"
+    );
+
+    // Leave nothing behind for the other tests sharing this instance.
+    store
+        .with_conn(|conn| conn.del::<_, ()>(cred_row_key(&bad_key, "sigv4", 0)))
+        .unwrap();
+    let _ = store.purge_key_for_test(&bad_key);
+    let _ = store.purge_key_for_test(&good_key);
 }

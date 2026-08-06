@@ -475,23 +475,101 @@ fn parse_slot_pointer(s: &str) -> Option<(String, String, u8)> {
     Some((key_id.to_string(), kind.to_string(), slot.parse().ok()?))
 }
 
-impl Store for ValkeyStore {
-    fn put_key(&self, key: &VirtualKey) -> StoreResult<()> {
-        let mut key = key.clone();
+/// Test-only cleanup surface. The conformance suite runs against a SHARED live Valkey that is not
+/// flushed between tests, so it has to be able to remove exactly the rows it is about to write —
+/// and it cannot do that through the `Store` trait, since `delete_key` deliberately TOMBSTONES
+/// rather than removing. These delete the underlying entries outright. `#[cfg(test)]` so none of it
+/// exists in a shipped artifact.
+#[cfg(test)]
+impl ValkeyStore {
+    /// Remove a key row and every index entry pointing at it, tombstone included.
+    pub(crate) fn purge_key_for_test(&self, id: &str) -> StoreResult<()> {
         self.with_conn(|c| {
-            let rev = self.next_revision(c)?;
-            key.revision = rev;
-            let json = serde_json::to_string(&key)
-                .map_err(|_e| redis::RedisError::from((redis::ErrorKind::Client, "encode")))?;
             redis::pipe()
                 .atomic()
-                .set(format!("{KEY_PREFIX}{}", key.id), &json)
+                .del(format!("{KEY_PREFIX}{id}"))
                 .ignore()
-                .sadd(KEYS_INDEX, &key.id)
+                .srem(KEYS_INDEX, id)
                 .ignore()
-                .zadd(KEYS_BYREV, &key.id, rev)
+                .zrem(KEYS_BYREV, id)
+                .ignore()
+                .del(cred_ids_key(id))
                 .ignore()
                 .query(c)
+        })
+    }
+
+    /// Remove a credential's id pointer. The slot row itself goes with its owning key.
+    pub(crate) fn purge_credential_for_test(&self, id: &str) -> StoreResult<()> {
+        self.with_conn(|c| {
+            redis::pipe()
+                .atomic()
+                .del(cred_id_key(id))
+                .ignore()
+                .query(c)
+        })
+    }
+
+    /// Remove whatever occupies one audit `seq`.
+    pub(crate) fn purge_audit_seq_for_test(&self, seq: u64) -> StoreResult<()> {
+        let score = clamp(seq);
+        self.with_conn(|c| {
+            redis::pipe()
+                .atomic()
+                .cmd("ZREMRANGEBYSCORE")
+                .arg(AUDIT_ZSET)
+                .arg(score)
+                .arg(score)
+                .ignore()
+                .query(c)
+        })
+    }
+}
+
+impl Store for ValkeyStore {
+    fn put_key(&self, key: &VirtualKey) -> StoreResult<()> {
+        let key = key.clone();
+        let row_key = format!("{KEY_PREFIX}{}", key.id);
+        self.with_conn(|c| {
+            // TOMBSTONE PRECONDITION (see `Store::put_key`): a live-shaped write must not overwrite
+            // a tombstoned row, which would reissue an id the contract says is never reissued and
+            // revive every token minted before the delete. WATCHed rather than read-then-written, so
+            // a `delete_key` committing between the read and the SET aborts and retries instead of
+            // slipping through — the same TOCTOU the caller-side checks in core cannot close.
+            redis::transaction(c, &[row_key.as_str()], |c, pipe| {
+                if key.deleted_at.is_none() {
+                    let existing: Option<String> = c.get(&row_key)?;
+                    // A row that does not parse is left to the normal write path rather than being
+                    // treated as a tombstone: refusing here would make a corrupt row permanently
+                    // unwritable, and this method is not the one that should be adjudicating that.
+                    if let Some(prior) = existing.as_deref().and_then(|r| key_from_json(r).ok()) {
+                        if prior.deleted_at.is_some() {
+                            return Err(redis::RedisError::from((
+                                redis::ErrorKind::Client,
+                                "put_key refused",
+                                format!(
+                                    "put_key: '{}' is tombstoned and its id is never reissued; \
+                                     refusing to clear the tombstone",
+                                    key.id
+                                ),
+                            )));
+                        }
+                    }
+                }
+                let mut key = key.clone();
+                let rev = self.next_revision(c)?;
+                key.revision = rev;
+                let json = serde_json::to_string(&key)
+                    .map_err(|_e| redis::RedisError::from((redis::ErrorKind::Client, "encode")))?;
+                pipe.atomic()
+                    .set(&row_key, &json)
+                    .ignore()
+                    .sadd(KEYS_INDEX, &key.id)
+                    .ignore()
+                    .zadd(KEYS_BYREV, &key.id, rev)
+                    .ignore()
+                    .query(c)
+            })
         })
     }
 
@@ -1181,10 +1259,15 @@ impl Store for ValkeyStore {
             redis::transaction(c, &[id_key.as_str()], |c, pipe| {
                 let ptr: Option<String> = c.get(&id_key)?;
                 let Some(ptr) = ptr else {
-                    // Unknown credential id: idempotent no-op, matching the trait's "Idempotent"
-                    // doc — nothing to revoke is not an error.
-                    pipe.atomic();
-                    return pipe.query(c);
+                    // Unknown credential id: an ERROR. The trait's "idempotent" covers revoking an
+                    // ALREADY-REVOKED id, not an id that names nothing — a silent no-op here lets
+                    // an operator responding to a leak believe the credential is dead while it is
+                    // still live and still authenticating.
+                    return Err(redis::RedisError::from((
+                        redis::ErrorKind::Client,
+                        "revoke_credential refused",
+                        format!("revoke_credential: unknown id '{id}'"),
+                    )));
                 };
                 // A pointer that exists but does not parse is CORRUPTION, not an unknown id.
                 // Returning Ok here would report a revocation that never happened: the row keeps
@@ -1251,9 +1334,40 @@ impl Store for ValkeyStore {
             }
             pipe.query(c)
         })?;
+        // A row that will not decode is SKIPPED, not propagated as an error for the whole call.
+        //
+        // This is the hydration delta, and it is a GLOBAL scan of every credential in the store, so
+        // failing the call on one bad row turns a single corrupt row into a total credential
+        // hydration failure for every key at once — the engine hydrates nothing and no credential
+        // authenticates anywhere. Skipping degrades that to exactly one credential missing.
+        //
+        // Skipping is also the fail-CLOSED direction here, which is why it is safe: a credential
+        // that cannot be decoded cannot be used to authenticate anyone, so omitting it from the
+        // delta denies access rather than granting it. Core's own `load_by_credential` already
+        // takes the same view, skipping credentials it cannot use rather than refusing to load.
+        //
+        // Deliberately NOT the same call as `delete_key`, which fails loud on a corrupt row: there,
+        // continuing would orphan that row's reverse-lookup pointers, so silence would leave the
+        // store inconsistent. Here nothing is written and nothing is left inconsistent.
+        //
+        // Reported on stderr because a plugin's `tracing` output does not reach the host (a cdylib
+        // links its own dispatcher and nothing bridges them) — the same local workaround auth-oidc
+        // and webrequest-hook already use. The row key names `key_id:kind:slot` and carries no
+        // secret.
         let mut out = Vec::with_capacity(raws.len());
-        for raw in raws.into_iter().flatten() {
-            out.push(cred_from_json(&raw)?);
+        for (i, raw) in raws.into_iter().enumerate() {
+            let Some(raw) = raw else { continue };
+            match cred_from_json(&raw) {
+                Ok(cred) => out.push(cred),
+                Err(e) => {
+                    eprintln!(
+                        "busbar-store-valkey: skipping undecodable credential row {} in the \
+                         hydration delta ({e}); that credential cannot authenticate until the row \
+                         is repaired, and the rest of the delta is unaffected",
+                        row_keys.get(i).map(String::as_str).unwrap_or("<unknown>")
+                    );
+                }
+            }
         }
         Ok(out)
     }
@@ -1263,16 +1377,45 @@ impl Store for ValkeyStore {
             .map_err(|e| StoreError(format!("audit encode failed: {e}")))?;
         let score = clamp(entry.seq);
         self.with_conn(|c| {
-            redis::pipe()
-                .atomic()
-                .cmd("ZREMRANGEBYSCORE")
-                .arg(AUDIT_ZSET)
-                .arg(score)
-                .arg(score)
-                .ignore()
-                .zadd(AUDIT_ZSET, &json, score)
-                .ignore()
-                .query(c)
+            // This used to ZREMRANGEBYSCORE the score then ZADD, i.e. OVERWRITE, last writer wins.
+            // That is the one outcome the trait rules out outright ("a store never rewrites or
+            // recomputes the digest"): it destroys the evidence in exactly the case that matters
+            // most, a second record claiming an occupied chain position.
+            //
+            // Compare instead, under WATCH so a concurrent append cannot land between the read and
+            // the write:
+            //   nothing there -> append.
+            //   identical     -> the write-through retrying after a lost ACK. Benign, Ok, no write.
+            //   different     -> a forked or tampered chain. Error, and the stored record stands.
+            redis::transaction(c, &[AUDIT_ZSET], |c, pipe| {
+                let existing: Vec<String> = c.zrangebyscore(AUDIT_ZSET, score, score)?;
+                if let Some(raw) = existing.first() {
+                    let stored: AuditRecord = serde_json::from_str(raw).map_err(|e| {
+                        redis::RedisError::from((
+                            redis::ErrorKind::Client,
+                            "audit decode failed",
+                            e.to_string(),
+                        ))
+                    })?;
+                    if stored == *entry {
+                        // No write at all: re-adding the identical member would be a no-op anyway,
+                        // and skipping it keeps this path free of any rewrite.
+                        pipe.atomic();
+                        return pipe.query(c);
+                    }
+                    return Err(redis::RedisError::from((
+                        redis::ErrorKind::Client,
+                        "append_audit refused",
+                        format!(
+                            "append_audit: seq {} already holds a DIFFERENT record; the audit \
+                             chain has forked (stored action '{}', incoming '{}')",
+                            entry.seq, stored.action, entry.action
+                        ),
+                    )));
+                }
+                pipe.atomic().zadd(AUDIT_ZSET, &json, score).ignore();
+                pipe.query(c)
+            })
         })
     }
 
