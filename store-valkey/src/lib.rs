@@ -437,6 +437,30 @@ impl ValkeyStore {
             Err(e) => {
                 if is_connection_error(&e) {
                     *guard = None;
+                } else {
+                    // CLEAR ANY LEFTOVER WATCH before this connection is handed to the next caller.
+                    //
+                    // `redis::transaction` issues WATCH, runs the closure, and only UNWATCHes on the
+                    // success path — a closure returning `Err` propagates through its `?` and skips
+                    // the UNWATCH entirely. This store keeps ONE connection behind a mutex and reuses
+                    // it, so that stale WATCH survives into the NEXT operation on the same store.
+                    //
+                    // The damage is silent, which is why this is handled here rather than per call
+                    // site. Every plain `redis::pipe().atomic()...query(c)` write in this file
+                    // (`add_denylist`, `put_usage`, `add_usage`, `add_metering`) types its reply as
+                    // `()`, and `FromRedisValue for ()` accepts ANY value including the `Nil` that a
+                    // dirtied WATCH makes EXEC return. So the transaction is aborted, nothing is
+                    // written, and the call reports `Ok(())`. For `add_denylist` that means an
+                    // operator revokes a leaked signed token, the store says it worked, and the token
+                    // goes on authenticating.
+                    //
+                    // Deliberately covers every error path, not just the refusals this crate returns
+                    // from inside a transaction closure on purpose: a genuine command error mid
+                    // closure leaks the WATCH just as completely. UNWATCH on a connection that is not
+                    // watching anything is a no-op, and its own failure is ignored — if it fails the
+                    // connection is unusable anyway and the error being returned is the one worth
+                    // reporting.
+                    let _ = redis::cmd("UNWATCH").exec(conn);
                 }
                 Err(self.err(e, "command"))
             }

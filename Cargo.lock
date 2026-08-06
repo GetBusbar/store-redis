@@ -135,10 +135,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "busbar-plugin-testkit"
+version = "1.5.0"
+dependencies = [
+ "busbar-api",
+]
+
+[[package]]
 name = "busbar-store-valkey"
 version = "1.0.0"
 dependencies = [
  "busbar-api",
+ "busbar-plugin-testkit",
  "redis",
  "rustls",
  "serde_json",

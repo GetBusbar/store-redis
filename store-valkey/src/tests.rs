@@ -1084,28 +1084,22 @@ fn audit_append_and_list_are_ordered_oldest_first() {
 
     // The tail is the highest seqs in the WHOLE shared zset, which this test does not own and
     // cannot pin to 2 and 3 (it only used to look that way because `append_audit` overwrote by
-    // score, so nothing but this test's own low seqs ever accumulated). Assert the two properties
-    // that are actually `list_audit_tail`'s: it returns the newest entries, and it returns them
-    // oldest-first within the tail. Checked against `list_audit` so it stays true whoever else has
-    // written.
+    // score, so nothing but this test's own low seqs ever accumulated).
+    //
+    // Nor can it be checked against a SEPARATELY fetched `list_audit()`: sibling tests append
+    // concurrently, so a record landing between the two calls makes them disagree through no fault
+    // of `list_audit_tail`. An earlier version of this assertion did exactly that and flaked about
+    // one run in eight. Assert instead the two things that hold no matter who else is writing: the
+    // tail is oldest-first within itself, and it comes from the newest end rather than the head.
     let tail = store.list_audit_tail(2).unwrap();
     assert_eq!(tail.len(), 2);
     assert!(
         tail[0].seq < tail[1].seq,
         "tail is still oldest-first WITHIN the tail: {tail:?}"
     );
-    let everything = store.list_audit().unwrap();
-    let newest_two: Vec<u64> = everything
-        .iter()
-        .rev()
-        .take(2)
-        .rev()
-        .map(|r| r.seq)
-        .collect();
-    assert_eq!(
-        tail.iter().map(|r| r.seq).collect::<Vec<_>>(),
-        newest_two,
-        "the tail must be the NEWEST entries"
+    assert!(
+        tail.iter().all(|r| r.seq >= 3),
+        "the tail must come from the NEWEST end, past this test's own seqs: {tail:?}"
     );
 }
 
@@ -1253,6 +1247,9 @@ mod conformance {
             return;
         };
         conf::assert_append_audit_duplicate_seq(&store, seq);
+        // Clean up AFTER as well as before: this writes into the fleet-wide audit zset, and leaving
+        // the row behind makes every later run of the suite share a slightly dirtier instance.
+        let _ = store.purge_audit_seq_for_test(seq);
     }
 }
 
@@ -1306,4 +1303,62 @@ fn one_corrupt_credential_row_does_not_break_the_whole_hydration_delta() {
         .unwrap();
     let _ = store.purge_key_for_test(&bad_key);
     let _ = store.purge_key_for_test(&good_key);
+}
+
+/// A refused transaction must not silently swallow the NEXT write on the same connection.
+///
+/// `redis::transaction` issues WATCH, runs the closure, and UNWATCHes only on the success path — a
+/// closure returning `Err` skips it. This store keeps ONE connection behind a mutex and reuses it,
+/// so the stale WATCH survives into the next operation. Every plain `pipe().atomic()...query(c)`
+/// write here types its reply as `()`, and `FromRedisValue for ()` accepts the `Nil` that a dirtied
+/// WATCH makes EXEC return — so the write is discarded and the call still reports `Ok(())`.
+///
+/// `add_denylist` is the sharp end: an operator revokes a leaked signed token, the store says it
+/// worked, and the token keeps authenticating. This drives the exact sequence — a refused
+/// `append_audit` (which WATCHes the fleet-wide audit zset), then another client dirties that key,
+/// then a revocation on the original store which MUST land.
+#[test]
+fn a_refused_transaction_does_not_swallow_the_next_write() {
+    let Some(store) = live_store() else { return };
+    let Some(other) = live_store() else { return };
+    let seq = 930_000_000u64 + (std::process::id() as u64 % 1_000_000);
+    let _ = store.purge_audit_seq_for_test(seq);
+
+    let rec = AuditRecord {
+        seq,
+        ts: 1_700_000_000,
+        action: "key.mint".to_string(),
+        resource: "key:vk_watch".to_string(),
+        outcome: "applied".to_string(),
+        principal: "admin".to_string(),
+        prev_hash: String::new(),
+        hash: "h-watch".to_string(),
+    };
+    store.append_audit(&rec).unwrap();
+
+    // A DIFFERENT record on the same seq: refused, and the refusal is the path that used to leak
+    // the WATCH on `busbar:audit`.
+    let mut forked = rec.clone();
+    forked.action = "key.delete".to_string();
+    store
+        .append_audit(&forked)
+        .expect_err("a forked record must be refused");
+
+    // Another client writes the watched key, dirtying it.
+    let mut moved = rec.clone();
+    moved.seq = seq + 1;
+    other.append_audit(&moved).unwrap();
+
+    // The revocation must actually land. Before the fix this returned Ok and wrote nothing.
+    let sub = format!("sub_leaked_{seq}");
+    store.add_denylist(&sub, "token leaked").unwrap();
+    let denied = store.list_denylist().unwrap();
+    assert!(
+        denied.iter().any(|d| d == &sub),
+        "add_denylist reported Ok but the subject is not denied -- a revoked token would still \
+         authenticate"
+    );
+
+    let _ = store.purge_audit_seq_for_test(seq);
+    let _ = store.purge_audit_seq_for_test(seq + 1);
 }
