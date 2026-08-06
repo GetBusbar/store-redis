@@ -228,7 +228,7 @@ fn url_password(url: &str) -> Option<String> {
 
 /// Percent-DECODE a URL component (`%40` -> `@`, `%25` -> `%`). A malformed escape is left verbatim.
 /// Used so the scrub redacts BOTH the raw (as-written-in-URL) and decoded forms of the password -
-/// the valkey driver may surface either in an error string (L1).
+/// the valkey driver may surface either in an error string.
 fn percent_decode(s: &str) -> String {
     let bytes = s.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
