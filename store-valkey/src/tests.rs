@@ -896,20 +896,19 @@ fn connect_refuses_to_start_under_an_eviction_policy() {
     );
 }
 
-// ── migrate() / with_conn retry — mutation-testing coverage gaps (round: cargo-mutants) ───────
+// ── migrate() / with_conn retry — guards for two predicates the broader tests do not pin ──────
 //
-// `cargo-mutants` against `store-valkey/src/lib.rs` found four real coverage gaps (no production
-// bug — the existing logic is correct, but nothing in the suite would have caught it breaking):
-//   - `migrate()`'s `version >= SCHEMA_VERSION` early-return guard (mutating `>=` to `<` survived
-//     every existing test) — nothing exercised a SECOND `connect()` against an
-//     already-migrated namespace, which is exactly the case that guard exists to protect: without
-//     it, every reconnect would wipe the entire shared `busbar:*` keyspace.
-//   - `run()`'s `retry && is_connection_error(&e)` match guard (mutating it to `true`, `false`, or
-//     `retry || is_connection_error(&e)` all survived) — nothing exercised either half of the
-//     condition independently: a non-connection error under `retry: true` (must NOT retry) or a
-//     genuine connection-level error (must retry and transparently recover).
+// Both predicates below are correct today, but nothing else in the suite would notice them
+// breaking:
+//   - `migrate()`'s `version >= SCHEMA_VERSION` early-return guard. Nothing else exercises a
+//     SECOND `connect()` against an already-migrated namespace, which is exactly the case that
+//     guard exists to protect: without it, every reconnect would wipe the entire shared
+//     `busbar:*` keyspace.
+//   - `run()`'s `retry && is_connection_error(&e)` match guard. Nothing else exercises either half
+//     of the condition independently: a non-connection error under `retry: true` (must NOT retry)
+//     or a genuine connection-level error (must retry and transparently recover).
 
-/// Kills the `version >= SCHEMA_VERSION` -> `version < SCHEMA_VERSION` mutant: a second
+/// Pins the `version >= SCHEMA_VERSION` early return specifically: a second
 /// `connect()` (fresh `ValkeyStore`, fresh internal `migrate()` call) against a namespace already
 /// at the current schema version must be a pure no-op, not a full `busbar:*` wipe.
 #[test]
@@ -932,7 +931,7 @@ fn reconnecting_to_an_already_migrated_namespace_does_not_wipe_existing_data() {
     );
 }
 
-/// Kills the `true` and `retry || is_connection_error(&e)` mutants: a deterministic
+/// Pins the `&&` in `retry && is_connection_error(&e)`: a deterministic
 /// NON-connection error (`WRONGTYPE`, from issuing `LPUSH` against a string-valued key) under
 /// `with_conn` (`retry: true`) must surface directly via the `"command"` error context, never
 /// silently retry — a retry would issue the exact same doomed command again and report it via the
@@ -960,7 +959,8 @@ fn with_conn_does_not_retry_a_non_connection_error() {
     store.with_conn(|c| c.del::<_, ()>(&k)).unwrap();
 }
 
-/// Kills the `false` mutant: a genuine connection-level error (the server killing our connection
+/// Pins the other half of that guard: a genuine connection-level error (the server killing our
+/// connection
 /// out from under us — the real-world case `with_conn`'s reconnect-and-retry exists for) must be
 /// transparently recovered, not surfaced to the caller.
 #[test]
@@ -1031,10 +1031,10 @@ fn audit_append_and_list_are_ordered_oldest_first() {
 }
 
 /// The v5->v6 SCHEMA_VERSION bump exists to close a real billing bug: `GovState::hydrate_budgets`
-/// (busbarAI core) used to infer "legacy pre-split row" from `billable_requests == 0 && requests >
-/// 0` alone, but that's ALSO the shape of a bucket that was legitimately fully refunded
-/// (`refund_bucket` decrements `billable_requests`, never `requests`) - so a restart could silently
-/// re-bill correctly-refunded fees. The fix moves the one-time cutover here, to a real schema-
+/// (busbarAI core) cannot infer "legacy pre-split row" from `billable_requests == 0 && requests >
+/// 0` alone, because that is ALSO the shape of a bucket that was legitimately fully refunded
+/// (`refund_bucket` decrements `billable_requests`, never `requests`), so a restart could silently
+/// re-bill correctly-refunded fees. The one-time cutover therefore lives here, at a real schema-
 /// version boundary (see `SCHEMA_VERSION`'s doc comment for the full rationale): any pre-v6
 /// namespace is wiped on the next `connect()`, exactly like every prior bump this crate has done,
 /// so `hydrate_budgets` can trust `billable_requests` unconditionally from v6 onward with no more
@@ -1046,7 +1046,7 @@ fn audit_append_and_list_are_ordered_oldest_first() {
 fn migrate_v5_to_v6_wipes_a_namespace_with_refund_shaped_data() {
     let Some(store) = live_store() else { return };
     // Seed data shaped exactly like the ambiguous case: billable_requests == 0, requests > 0 (a
-    // legitimately-refunded window, or - before this fix existed - an unmigrated legacy row).
+    // legitimately-refunded window, or an unmigrated legacy row).
     let bucket = "vk_migrate_v6_refund_shaped";
     let ledger = busbar_api::UsageLedger {
         requests: 3,

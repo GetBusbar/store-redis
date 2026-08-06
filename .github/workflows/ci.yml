@@ -41,10 +41,8 @@ jobs:
   # migrate()'s destructive-wipe test (store-valkey/src/tests.rs) SCAN+DELETEs the ENTIRE busbar:*
   # namespace on whatever live Valkey VALKEY_URL points at — it is #[ignore]'d and must run ALONE,
   # never concurrently with the `ci` job's own tests against the same shared service container (see
-  # that test's own doc comment for the full rationale). It used to run via plugin-ci.yml's
-  # `extra_sibling_test_command` against busbarAI's copy of this crate; now that busbar-store-valkey
-  # lives in this repo instead, it runs here, in its own isolated job against its own dedicated
-  # valkey/valkey:8 service container.
+  # that test's own doc comment for the full rationale). It runs here, in its own isolated job
+  # against its own dedicated valkey/valkey:8 service container.
   migrate-destructive-wipe-test:
     name: migrate() destructive-wipe test (isolated, own valkey/valkey:8 container)
     runs-on: ubuntu-latest
