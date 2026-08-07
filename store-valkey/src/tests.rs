@@ -1091,24 +1091,49 @@ fn audit_append_and_list_are_ordered_oldest_first() {
     // of `list_audit_tail`. An earlier version of this assertion did exactly that and flaked about
     // one run in eight. Assert instead the two things that hold no matter who else is writing: the
     // tail is oldest-first within itself, and it comes from the newest end rather than the head.
+    // WHICH END the tail comes from has to be asserted, and can be, race-free.
+    //
+    // Two earlier versions of this were wrong in opposite directions. `all(seq >= 3)` was FALSE
+    // whenever the zset held only this test's own 1,2,3 and passed on a sibling's litter. Dropping
+    // the claim entirely then left assertions that a BROKEN implementation satisfies: returning the
+    // OLDEST entries still yields two records in ascending order, so `list_audit_tail` could have
+    // been reading the wrong end of the log with nothing anywhere noticing.
+    //
+    // The race-free version: append a record whose seq is higher than anything else present, then
+    // require it in the tail. Sibling writers can only push it out by writing an even HIGHER seq,
+    // and this test owns the top of the range by construction, so there is nothing to race.
+    let top = store
+        .list_audit()
+        .unwrap()
+        .iter()
+        .map(|r| r.seq)
+        .max()
+        .unwrap_or(0)
+        .saturating_add(1_000);
+    store
+        .append_audit(&AuditRecord {
+            seq: top,
+            ts: 1000,
+            action: "key.mint".to_string(),
+            resource: "key:vk_top".to_string(),
+            outcome: "applied".to_string(),
+            principal: "admin".to_string(),
+            prev_hash: String::new(),
+            hash: format!("h{top}"),
+        })
+        .unwrap();
     let tail = store.list_audit_tail(2).unwrap();
     assert_eq!(tail.len(), 2);
     assert!(
         tail[0].seq < tail[1].seq,
-        "tail is still oldest-first WITHIN the tail: {tail:?}"
+        "the tail is oldest-first WITHIN the tail: {tail:?}"
     );
-    // Deliberately makes NO claim about WHICH entries the tail contains.
-    //
-    // Two earlier attempts here were both wrong for the same underlying reason: this test does not
-    // own `busbar:audit`. Asserting `seq >= 3` was false whenever the zset held only this test's own
-    // 1,2,3 (tail = [2,3]) and passed only on a sibling's litter. Asserting the tail is a slice of a
-    // separately-fetched `list_audit` then raced siblings PURGING their seqs between the two reads.
-    // A global-shape claim is simply not verifiable from here while other tests mutate the same key.
-    //
-    // What is race-free and is genuinely `list_audit_tail`'s contract: whatever it returns comes back
-    // OLDEST-FIRST within the tail. That is asserted above. The ordering of this test's own three
-    // records is asserted against the filtered `list_audit` view, which is likewise unaffected by
-    // siblings. Between them the method's two promises are covered without borrowing anyone's state.
+    assert!(
+        tail.iter().any(|r| r.seq == top),
+        "the newest record must be IN the tail -- without this, an implementation returning the \
+         OLDEST entries passes: {tail:?}"
+    );
+    let _ = store.purge_audit_seq_for_test(top);
 }
 
 /// The v5->v6 SCHEMA_VERSION bump exists to close a real billing bug: `GovState::hydrate_budgets`
